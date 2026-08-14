@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "name": "oxo-flow-snparcher",
+  "title": "snpArcher (port)",
+  "engine": "oxo-flow",
+  "source": {
+    "repo": "harvardinformatics/snparcher",
+    "url": "https://github.com/harvardinformatics/snparcher",
+    "tag": "v2.2",
+    "sha": "e0e7a9478d4e042fce217db4e6077dafdaf57245",
+    "license": "MIT"
+  },
+  "created": "2026-08-15",
+  "domain": "genomics",
+  "tags": ["variant-calling", "population-genomics", "gatk", "bwa", "non-model-organisms", "snakemake"],
+  "description": "oxo-flow port of the harvardinformatics/snparcher v2.2 default main path: FASTQ sample sheets -> fastp trimming/filtering -> BWA-MEM alignment -> GATK HaplotypeCaller per-sample gVCFs, plus a cohort QC metrics report.",
+  "scope": ["prepare_reference", "index_reference", "fastp", "bwa_mem", "merge_library_bams", "merge_library_level_bams", "index_bam_csi", "gatk_haplotypecaller", "collect_fastp_stats", "bam_stats", "parse_bam_stats", "combine_qc_metrics"],
+  "excluded": [
+    "markdup (sambamba markdup + merge_dedup_libraries) — committee exclusion; port default mark_duplicates=false",
+    "joint_genotyping (GenomicsDBImport/GenotypeGVCFs + interval scatter machinery) — committee exclusion",
+    "denovo — no such step in upstream v2.2 (v2 redesign)",
+    "structural_variants — no such step in upstream v2.2",
+    "variant_filtration — requires the excluded joint-genotyping raw VCF",
+    "download_sra — srr input type out of scope",
+    "stage_external_bam — bam input type out of scope",
+    "callable_sites (mosdepth/clam/genmap/bedtools chain) — out of scope",
+    "non-gatk callers (bcftools/deepvariant/glnexus/parabricks/sentieon rules) — config-selected only",
+    "modules qc and postprocess — disabled by default upstream"
+  ],
+  "rule_count": 12,
+  "tools": ["fastp@1.3.6", "bwa@0.7.19", "samtools@1.24", "gatk4@4.6.2.0", "python@3 (system)"],
+  "status": "ready",
+  "repo_url": "https://github.com/oxo-flow-community/oxo-flow-snparcher",
+  "site_page": "https://oxo-flow-community.github.io/oxo-flow-snparcher/",
+  "upstream_license": "MIT"
+}

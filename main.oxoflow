@@ -1,0 +1,283 @@
+# snpArcher (harvardinformatics/snparcher @ v2.2) — oxo-flow port
+#
+# Default-parameters main execution path:
+#   sample sheet (FASTQ inputs) -> fastp (read trimming/filtering)
+#   -> BWA-MEM + samtools sort -> samtools merge (no duplicate marking)
+#   -> GATK HaplotypeCaller (per-sample gVCF) -> QC metrics report
+#
+# Scope deviations from upstream defaults (see README fidelity table):
+#   - mark_duplicates = false  (upstream default true; sambamba markdup excluded)
+#   - intervals.enabled = false (upstream default true; interval scatter +
+#     GenomicsDB joint genotyping excluded)
+#   - library_id / input_unit modeled as {sample} / u1 (upstream defaults for
+#     single-row-per-sample sheets)
+#   - reference_source points at the tiny committed fixture genome; override
+#     with your own genome before real runs
+
+[workflow]
+name = "snparcher"
+version = "2.2.0"
+description = "Variant calling for non-model organisms — fastp, BWA-MEM, GATK HaplotypeCaller. oxo-flow port of harvardinformatics/snparcher v2.2."
+author = "oxo-flow-community"
+
+[config]
+reference_name = "my_organism"
+reference_source = "test/fixtures/ref/genome.fa"
+expected_coverage = "low"
+ploidy = 2
+mark_duplicates = false
+intervals_enabled = false
+
+[defaults]
+memory = "8G"
+
+[[sample_groups]]
+name = "cohort"
+samples = ["sample1", "sample2"]
+
+# ---------------------------------------------------------------------------
+# Reference preparation
+# ---------------------------------------------------------------------------
+
+[[rules]]
+name = "prepare_reference"
+description = "Prepare the reference genome as a bgzip-compressed FASTA"
+input = []
+output = ["results/reference/{config.reference_name}.fa.gz"]
+log = "logs/prepare_reference/{config.reference_name}.txt"
+shell = """
+if [[ "{config.reference_source}" == *.gz ]]; then
+    gunzip -c "{config.reference_source}" | bgzip -c > {output[0]}
+else
+    bgzip -c "{config.reference_source}" > {output[0]}
+fi
+"""
+
+[rules.environment]
+conda = "envs/reference.yaml"
+
+[[rules]]
+name = "index_reference"
+description = "Index the reference (samtools faidx/dict, BWA index)"
+input = ["results/reference/{config.reference_name}.fa.gz"]
+output = [
+    "results/reference/{config.reference_name}.fa.gz.gzi",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+    "results/reference/{config.reference_name}.fa.gz.sa",
+    "results/reference/{config.reference_name}.fa.gz.pac",
+    "results/reference/{config.reference_name}.fa.gz.bwt",
+    "results/reference/{config.reference_name}.fa.gz.ann",
+    "results/reference/{config.reference_name}.fa.gz.amb",
+]
+log = "logs/index_reference/{config.reference_name}.txt"
+shell = """
+samtools faidx {input[0]}
+samtools dict {input[0]} -o {output[2]}
+bwa index {input[0]}
+"""
+
+[rules.environment]
+conda = "envs/reference.yaml"
+
+# ---------------------------------------------------------------------------
+# Read trimming / filtering (fastp)
+# ---------------------------------------------------------------------------
+
+[[rules]]
+name = "fastp"
+description = "Adapter detection and quality filtering of read pairs with fastp"
+input = [
+    "raw/{sample}_1.fastq.gz",
+    "raw/{sample}_2.fastq.gz",
+]
+output = [
+    "results/filtered_fastqs/{sample}/{sample}/u1_1.fastq.gz",
+    "results/filtered_fastqs/{sample}/{sample}/u1_2.fastq.gz",
+    "results/fastp/{sample}/{sample}/u1.json",
+]
+log = "logs/fastp/{sample}.txt"
+shell = """
+fastp \
+    --in1 {input[0]} \
+    --in2 {input[1]} \
+    --out1 {output[0]} \
+    --out2 {output[1]} \
+    --thread {threads} \
+    --detect_adapter_for_pe \
+    -j {output[2]} \
+    -h /dev/null
+"""
+tags = ["qc", "trimming"]
+
+[rules.resources]
+threads = 4
+
+[rules.environment]
+conda = "envs/fastp.yaml"
+
+# ---------------------------------------------------------------------------
+# Alignment (BWA-MEM) and BAM merging
+# ---------------------------------------------------------------------------
+
+[[rules]]
+name = "bwa_mem"
+description = "Align reads with bwa mem and sort with samtools"
+input = [
+    "results/filtered_fastqs/{sample}/{sample}/u1_1.fastq.gz",
+    "results/filtered_fastqs/{sample}/{sample}/u1_2.fastq.gz",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+output = ["results/bams/raw/{sample}/{sample}/u1.bam"]
+temp_output = ["results/bams/raw/{sample}/{sample}/u1.bam"]
+log = "logs/bwa_mem/{sample}.txt"
+shell = """
+bwa mem -M -t {threads} -R "@RG\\tID:{sample}.u1\\tSM:{sample}\\tLB:{sample}\\tPL:ILLUMINA" \
+    {input[2]} {input[0]} {input[1]} | samtools sort -o {output[0]} -
+"""
+tags = ["alignment"]
+
+[rules.resources]
+threads = 8
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "merge_library_bams"
+description = "Merge per-input-unit BAMs into a per-library BAM"
+input = ["results/bams/raw/{sample}/{sample}/u1.bam"]
+output = ["results/bams/library/{sample}/{sample}.bam"]
+temp_output = ["results/bams/library/{sample}/{sample}.bam"]
+log = "logs/merge_library_bams/{sample}.txt"
+shell = "samtools merge {output[0]} {input[0]}"
+tags = ["alignment"]
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "merge_library_level_bams"
+description = "Merge per-library BAMs into the final sample BAM (no duplicate marking)"
+input = ["results/bams/library/{sample}/{sample}.bam"]
+output = ["results/bams/merged/{sample}.bam"]
+log = "logs/merge_library_level_bams/{sample}.txt"
+shell = "samtools merge {output[0]} {input[0]}"
+tags = ["alignment"]
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "index_bam_csi"
+description = "Index the final BAM with CSI (required by GATK)"
+input = ["results/bams/merged/{sample}.bam"]
+output = ["results/bams/merged/{sample}.bam.csi"]
+log = "logs/index_bam_csi/{sample}.txt"
+shell = "samtools index -c {input[0]} {output[0]}"
+tags = ["alignment"]
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+# ---------------------------------------------------------------------------
+# Variant calling (GATK HaplotypeCaller, per-sample gVCF)
+# ---------------------------------------------------------------------------
+
+[[rules]]
+name = "gatk_haplotypecaller"
+description = "Per-sample variant calling to gVCF with GATK HaplotypeCaller"
+input = [
+    "results/bams/merged/{sample}.bam",
+    "results/bams/merged/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+output = [
+    "results/gvcfs/{sample}.g.vcf.gz",
+    "results/gvcfs/{sample}.g.vcf.gz.tbi",
+]
+log = "logs/gatk_haplotypecaller/{sample}.txt"
+shell = """
+gatk HaplotypeCaller \
+    --java-options '-Xmx7000m' \
+    -R {input[2]} \
+    -I {input[0]} \
+    --read-index {input[1]} \
+    -O {output[0]} \
+    -ploidy {config.ploidy} \
+    --native-pair-hmm-threads {threads} \
+    --emit-ref-confidence GVCF \
+    --min-pruning 1 \
+    --min-dangling-branch-length 1
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+# ---------------------------------------------------------------------------
+# QC metrics (fastp stats, BAM stats, combined report)
+# ---------------------------------------------------------------------------
+
+[[rules]]
+name = "collect_fastp_stats"
+description = "Aggregate fastp per-unit stats into a per-sample JSON"
+input = ["results/fastp/{sample}/{sample}/u1.json"]
+output = ["results/qc_metrics/fastp/{sample}.json"]
+log = "logs/collect_fastp_stats/{sample}.txt"
+script = "scripts/collect_fastp_stats.py {input} {output}"
+tags = ["qc"]
+
+[[rules]]
+name = "bam_stats"
+description = "Compute samtools coverage and flagstat metrics"
+input = ["results/bams/merged/{sample}.bam"]
+output = [
+    "results/qc_metrics/bam/{sample}_coverage.txt",
+    "results/qc_metrics/bam/{sample}_flagstat.txt",
+]
+temp_output = [
+    "results/qc_metrics/bam/{sample}_coverage.txt",
+    "results/qc_metrics/bam/{sample}_flagstat.txt",
+]
+log = "logs/bam_stats/{sample}.txt"
+shell = """
+samtools coverage {input[0]} -o {output[0]}
+samtools flagstat -O tsv {input[0]} > {output[1]}
+"""
+tags = ["qc"]
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "parse_bam_stats"
+description = "Parse samtools coverage/flagstat output into a per-sample JSON"
+input = [
+    "results/qc_metrics/bam/{sample}_coverage.txt",
+    "results/qc_metrics/bam/{sample}_flagstat.txt",
+]
+output = ["results/qc_metrics/bam/{sample}.json"]
+log = "logs/parse_bam_stats/{sample}.txt"
+script = "scripts/parse_bam_stats.py {input} {output}"
+tags = ["qc"]
+
+[[rules]]
+name = "combine_qc_metrics"
+description = "Combine per-sample QC stats into the final TSV report"
+input = []
+expand_inputs = [
+    { pattern = "results/qc_metrics/fastp/{sample}.json", variables = { sample = "config.samples_list" } },
+    { pattern = "results/qc_metrics/bam/{sample}.json", variables = { sample = "config.samples_list" } },
+]
+output = ["results/qc_metrics/qc_report.tsv"]
+log = "logs/combine_qc_metrics.txt"
+script = "scripts/combine_qc_metrics.py {input} {output}"
+tags = ["qc"]
