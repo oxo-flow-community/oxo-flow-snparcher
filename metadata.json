@@ -1,8 +1,9 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
   "name": "oxo-flow-snparcher",
-  "title": "snpArcher (port)",
-  "engine": "oxo-flow",
+  "title": "Variant calling for non-model organisms: trimming, alignment and per-sample gVCFs",
+  "origin": "port",
+  "rating": "verified",
+  "engine": "snakemake",
   "source": {
     "repo": "harvardinformatics/snparcher",
     "url": "https://github.com/harvardinformatics/snparcher",
@@ -13,7 +14,6 @@
   "created": "2026-08-15",
   "domain": "genomics",
   "tags": ["variant-calling", "population-genomics", "gatk", "bwa", "non-model-organisms", "snakemake"],
-  "description": "oxo-flow port of the harvardinformatics/snparcher v2.2 default main path: FASTQ sample sheets -> fastp trimming/filtering -> BWA-MEM alignment -> GATK HaplotypeCaller per-sample gVCFs, plus a cohort QC metrics report.",
   "scope": ["prepare_reference", "index_reference", "fastp", "bwa_mem", "merge_library_bams", "merge_library_level_bams", "index_bam_csi", "gatk_haplotypecaller", "collect_fastp_stats", "bam_stats", "parse_bam_stats", "combine_qc_metrics"],
   "excluded": [
     "markdup (sambamba markdup + merge_dedup_libraries) — committee exclusion; port default mark_duplicates=false",
@@ -28,9 +28,19 @@
     "modules qc and postprocess — disabled by default upstream"
   ],
   "rule_count": 12,
-  "tools": ["fastp@1.3.6", "bwa@0.7.19", "samtools@1.24", "gatk4@4.6.2.0", "python@3 (system)"],
-  "status": "ready",
+  "tools": ["fastp", "bwa", "samtools", "gatk4", "python"],
+  "description": "Variant calling for non-model organisms: paired FASTQ reads are trimmed and filtered with fastp, aligned with BWA-MEM, and called to per-sample gVCFs with GATK HaplotypeCaller (low-coverage defaults: -ploidy 2, --min-pruning 1), alongside a cohort QC metrics report aggregating fastp and samtools stats.",
+  "installation": {
+    "engine": "oxo-flow >= 0.11.0",
+    "toolchain": "conda envs — pinned versions (fastp 1.3.6, bwa 0.7.19, samtools 1.24, gatk4 4.6.2.0; conda-forge + bioconda)",
+    "requirements": [
+      "reference genome FASTA (plain or gzip), passed as reference_source at run time — bgzip-compressed and indexed by the workflow itself (no pre-built indices)",
+      "paired-end reads at raw/<sample>_1.fastq.gz and raw/<sample>_2.fastq.gz for each sample in the [[sample_groups]] list",
+      "compute: up to 8 CPUs / 8 GB per rule (bwa_mem 8 threads, fastp 4, gatk_haplotypecaller 7 GB Java heap)",
+      "conda or mamba at runtime to create the pinned envs/*.yaml environments"
+    ]
+  },
   "repo_url": "https://github.com/oxo-flow-community/oxo-flow-snparcher",
-  "site_page": "https://oxo-flow-community.github.io/oxo-flow-snparcher/",
+  "license": "Apache-2.0",
   "upstream_license": "MIT"
 }

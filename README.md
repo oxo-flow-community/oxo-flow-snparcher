@@ -1,20 +1,87 @@
-# oxo-flow-snparcher
+# oxo-flow-snparcher — Variant calling for non-model organisms: trimming, alignment and per-sample gVCFs
+
+> ★ Verified · ⇄ Official port of [`harvardinformatics/snparcher`](https://github.com/harvardinformatics/snparcher) @ `v2.2` — same tools, same versions, same commands. Part of the [oxo-flow-community catalog](https://oxo-flow-community.github.io/).
 
 [![CI](https://github.com/oxo-flow-community/oxo-flow-snparcher/actions/workflows/ci.yml/badge.svg)](https://github.com/oxo-flow-community/oxo-flow-snparcher/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-Variant calling for non-model organisms: FASTQ sample sheets are trimmed and
-filtered with fastp, aligned with BWA-MEM, and called to per-sample gVCFs
-with GATK HaplotypeCaller, alongside a cohort QC metrics report. This is the
-default-parameters main execution path of snpArcher, ported to oxo-flow.
+Point this workflow at a directory of paired-end FASTQ files plus a reference
+genome, and it returns per-sample gVCFs and a cohort QC report. Each read pair
+is trimmed and filtered with fastp, aligned to your reference with BWA-MEM,
+and called with GATK HaplotypeCaller using low-coverage-appropriate defaults
+(`-ploidy 2`, `--emit-ref-confidence GVCF`, `--min-pruning 1`); a QC stage
+aggregates fastp and samtools metrics for every sample into a single TSV
+report. The pipeline is designed for non-model organisms where no population
+panel exists — it assumes diploid calls from a single sample at a time.
+
+## Installation
+
+### 1. Install oxo-flow
+
+Requires oxo-flow >= 0.11.0. Prebuilt release binary (recommended):
+
+```bash
+curl -fL -o oxo-flow.tar.gz \
+  https://github.com/Traitome/oxo-flow/releases/download/v0.11.0/oxo-flow-v0.11.0-x86_64-unknown-linux-gnu.tar.gz
+tar xzf oxo-flow.tar.gz
+sudo mv oxo-flow /usr/local/bin/
+```
+
+Alternatively via conda: `conda install -c bioconda oxo-flow-cli` (note: the
+bioconda package may lag behind releases; other platform binaries are on the
+[releases page](https://github.com/Traitome/oxo-flow/releases)).
+
+### 2. Get this workflow
+
+```bash
+git clone https://github.com/oxo-flow-community/oxo-flow-snparcher.git
+cd oxo-flow-snparcher
+```
+
+### 3. Requirements
+
+- **Reference data**: the only external reference input is your genome — a
+  FASTA file (plain or gzip-compressed), passed at run time as
+  `reference_source=/path/to/genome.fa.gz` (the committed default points at
+  the tiny `test/fixtures/ref/genome.fa` fixture, so set it before real
+  runs). The workflow bgzip-compresses and indexes it itself
+  (`prepare_reference` + `index_reference`), so no pre-built indices are
+  required. Reads go in `raw/<sample>_1.fastq.gz` / `raw/<sample>_2.fastq.gz`
+  for every sample listed in the `[[sample_groups]]` of `main.oxoflow`.
+- **Compute**: up to 8 CPUs and 8 GB per rule — `bwa_mem` uses 8 threads,
+  `fastp` 4, and `gatk_haplotypecaller` a 7 GB Java heap (1 thread).
+- **Tools**: delivered as conda environments with pinned versions
+  (`envs/*.yaml`, conda-forge + bioconda: fastp 1.3.6, bwa 0.7.19, samtools
+  1.24, gatk4 4.6.2.0), so conda or mamba must be installed at runtime;
+  oxo-flow creates the environments on first run.
+
+## Usage
+
+```bash
+# 1. install oxo-flow (see Requirements)
+# 2. prepare data: raw/<sample>_1.fastq.gz / raw/<sample>_2.fastq.gz
+#    (tiny examples in test/fixtures/raw/)
+# 3. set your reference genome
+oxo-flow run main.oxoflow reference_source=/path/to/genome.fa.gz
+# 4. preview the plan
+oxo-flow dry-run main.oxoflow
+# 5. run a subset
+oxo-flow run main.oxoflow --samples first:2
+```
+
+The sample sheet of upstream snpArcher (`sample_id, input_type, input,
+library_id, mark_duplicates`) is represented by the sample list in
+`main.oxoflow` (`[[sample_groups]]`) — one row per sample with local FASTQ
+inputs, empty `library_id` (defaults to `sample_id`), and a single input
+unit. Multi-row sheets (multiple libraries/units) and `srr`/`bam`/`gvcf`
+input types are not ported.
 
 ## Source
 
 Ported from **[harvardinformatics/snparcher](https://github.com/harvardinformatics/snparcher)**,
 version `v2.2` (commit `e0e7a9478d4e042fce217db4e6077dafdaf57245`, MIT).
-Created 2026-08-15. This port is maintained independently and **may lag the
-upstream** — check the version above and the fidelity table below for the
-exact ported state.
+Created 2026-08-15; this workflow may lag behind upstream releases. Upstream
+license and attribution are recorded in [NOTICE.md](NOTICE.md).
 
 ## Fidelity
 
@@ -58,49 +125,17 @@ exact pins (fastp 1.3.6, samtools 1.24, bwa 0.7.19, gatk4 4.6.2.0, picard
 (2026-08-15). Upstream default-profile thread overrides (fastp 6, bwa_mem
 16) are runtime knobs; the port keeps the rules' own declarations (4 and 8).
 
-## Quickstart
+## Test
+
+Run the acceptance suite (validate + lint + dry-run) against the committed
+fixture data:
 
 ```bash
-# 1. install oxo-flow (see Requirements)
-# 2. prepare data: raw/<sample>_1.fastq.gz / raw/<sample>_2.fastq.gz
-#    (tiny examples in test/fixtures/raw/)
-# 3. set your reference genome
-oxo-flow run main.oxoflow reference_source=/path/to/genome.fa.gz
-# 4. preview the plan
-oxo-flow dry-run main.oxoflow
-# 5. run a subset
-oxo-flow run main.oxoflow --samples first:2
+bash test/run.sh
 ```
-
-The sample sheet of upstream snpArcher (`sample_id, input_type, input,
-library_id, mark_duplicates`) is represented by the sample list in
-`main.oxoflow` (`[[sample_groups]]`) — one row per sample with local FASTQ
-inputs, empty `library_id` (defaults to `sample_id`), and a single input
-unit. Multi-row sheets (multiple libraries/units) and `srr`/`bam`/`gvcf`
-input types are not ported.
-
-## Requirements
-
-- **oxo-flow ≥ 0.11.0** — install the prebuilt binary:
-
-```bash
-curl -fL -o oxo-flow.tar.gz \
-  https://github.com/Traitome/oxo-flow/releases/download/v0.11.0/oxo-flow-v0.11.0-x86_64-unknown-linux-gnu.tar.gz
-tar xzf oxo-flow.tar.gz
-sudo mv oxo-flow /usr/local/bin/
-```
-
-- Conda users may alternatively `conda install -c bioconda oxo-flow-cli`
-  (note: the bioconda package currently lags the release binary at 0.10.2 —
-  some 0.11.0 format features may not validate).
-- Conda (mamba/micromamba) at runtime for the environments declared in
-  `main.oxoflow` (`envs/*.yaml`).
 
 ## License
 
 Apache-2.0. Copyright (c) 2026 oxo-flow-community. Upstream attribution in
-[NOTICE.md](NOTICE.md).
-
-## Community
-
-https://oxo-flow-community.github.io/
+[NOTICE.md](NOTICE.md). The upstream snpArcher project is MIT-licensed; its
+license text is included verbatim at [LICENSE.upstream](LICENSE.upstream).
