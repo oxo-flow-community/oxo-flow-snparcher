@@ -1,0 +1,10 @@
+name: sra
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - sra-tools=3.2.1
+  - pigz>=2.6
+  - curl>=7.73
+  - ffq>=0.3.1
+  - jq

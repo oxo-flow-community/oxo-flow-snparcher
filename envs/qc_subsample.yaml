@@ -1,0 +1,6 @@
+name: qc_subsample
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bcftools=1.23

@@ -5,14 +5,26 @@
 #   -> BWA-MEM + samtools sort -> samtools merge (no duplicate marking)
 #   -> GATK HaplotypeCaller (per-sample gVCF) -> QC metrics report
 #
-# Scope deviations from upstream defaults (see README fidelity table):
-#   - mark_duplicates = false  (upstream default true; sambamba markdup excluded)
-#   - intervals.enabled = false (upstream default true; interval scatter +
-#     GenomicsDB joint genotyping excluded)
-#   - library_id / input_unit modeled as {sample} / u1 (upstream defaults for
-#     single-row-per-sample sheets)
-#   - reference_source points at the tiny committed fixture genome; override
-#     with your own genome before real runs
+# Ported branches, gated by config keys (all default OFF so the default plan
+# is unchanged; flip a key to activate a branch — see README fidelity table):
+#   mark_duplicates=true        sambamba markdup + merge (upstream default true)
+#   variant_tool='deepvariant'  DeepVariant per-sample gVCF calling (docker)
+#   joint_genotyping_enabled=true   GATK GenomicsDBImport + GenotypeGVCFs
+#                               (deepvariant: GLnexus joint genotyping)
+#   generate_filtered_vcf=true  GATK hard variant filtration (needs joint VCF)
+#   callable_sites_enabled=true mosdepth/clam coverage + genmap mappability
+#                               -> results/callable_sites/callable_sites.bed
+#   modules_postprocess_enabled=true  postprocess module (needs callable BED)
+#   modules_qc_enabled=true     qc module (plink/admixture/dashboard)
+#   input_type per sample group: 'fastq' (default), 'srr' (SRA download +
+#   fastp), or 'bam' (stage external BAM) — set in [[sample_groups]] metadata
+#
+# Structural exclusions (impossible in the oxo-flow static DAG — see README):
+#   interval scatter (snakemake checkpoints create_gvcf_intervals /
+#   create_db_intervals extend the DAG at runtime), bcftools caller
+#   (bcftools_regions checkpoint), parabricks (GPU --nv passthrough +
+#   NVIDIA license), sentieon (proprietary license), gvcf input type
+#   (external per-sample paths cannot feed group expansion)
 
 [workflow]
 name = "snparcher"
@@ -27,13 +39,61 @@ expected_coverage = "low"
 ploidy = 2
 mark_duplicates = false
 intervals_enabled = false
+variant_tool = "gatk"
+joint_genotyping_enabled = false
+generate_filtered_vcf = false
+callable_sites_enabled = false
+modules_postprocess_enabled = false
+modules_qc_enabled = false
+gatk_het_prior = 0.005
+deepvariant_model_type = "WGS"
+callable_sites_min_coverage = "auto"
+callable_sites_max_coverage = "auto"
+callable_sites_fraction = 1.0
+callable_sites_merge_distance = 100
+callable_sites_kmer = 150
+callable_sites_min_score = 1
+postprocess_contig_size = 10000
+postprocess_maf = 0.01
+postprocess_missingness = 0.75
+postprocess_exclude_scaffolds = "mtDNA,Y"
+qc_min_depth = 2
+qc_max_sample_missingness = 0.49
+qc_exclude_scaffolds = ""
+qc_clusters = 3
+qc_google_api_key = ""
 
 [defaults]
 memory = "8G"
 
+# Sample groups. The default cohort uses local paired FASTQs (input_type
+# "fastq"). Rule fan-out is per (rule, group, sample) with wildcard gates on
+# `wildcard.input_type`, so a group's input type routes its samples through
+# the matching branch. Group names become rule-instance names — keep them
+# stable. To add other input types, add groups like:
+#
+#   # SRA inputs (download_sra -> fastp_srr): accession is required metadata
+#   [[sample_groups]]
+#   name = "sra"
+#   samples = ["my_sra_sample"]
+#   metadata = { input_type = "srr", accession = "SRR12345678" }
+#
+#   # External BAM inputs (stage_external_bam): bam_path is required metadata
+#   [[sample_groups]]
+#   name = "external"
+#   samples = ["my_bam_sample"]
+#   metadata = { input_type = "bam", bam_path = "/path/to/sample.bam" }
+#
+# Upstream's sample sheet columns (sample_id, input_type, input, library_id,
+# mark_duplicates) map to: sample id = [[sample_groups]] entry, input_type =
+# metadata.input_type, input = metadata (accession / bam_path / raw FASTQs),
+# library_id = sample id, mark_duplicates = global config. Per-sample
+# mark_duplicates overrides are not ported.
+
 [[sample_groups]]
 name = "cohort"
 samples = ["sample1", "sample2"]
+metadata = { input_type = "fastq" }
 
 # ---------------------------------------------------------------------------
 # Reference preparation
@@ -81,12 +141,12 @@ bwa index {input[0]}
 conda = "envs/reference.yaml"
 
 # ---------------------------------------------------------------------------
-# Read trimming / filtering (fastp)
+# Read acquisition and trimming / filtering (fastp)
 # ---------------------------------------------------------------------------
 
 [[rules]]
 name = "fastp"
-description = "Adapter detection and quality filtering of read pairs with fastp"
+description = "Adapter detection and quality filtering of read pairs with fastp (local FASTQ inputs)"
 input = [
     "raw/{sample}_1.fastq.gz",
     "raw/{sample}_2.fastq.gz",
@@ -96,7 +156,84 @@ output = [
     "results/filtered_fastqs/{sample}/{sample}/u1_2.fastq.gz",
     "results/fastp/{sample}/{sample}/u1.json",
 ]
+when = "wildcard.input_type == 'fastq'"
 log = "logs/fastp/{sample}.txt"
+shell = """
+fastp \
+    --in1 {input[0]} \
+    --in2 {input[1]} \
+    --out1 {output[0]} \
+    --out2 {output[1]} \
+    --thread {threads} \
+    --detect_adapter_for_pe \
+    -j {output[2]} \
+    -h /dev/null
+"""
+tags = ["qc", "trimming"]
+
+[rules.resources]
+threads = 4
+
+[rules.environment]
+conda = "envs/fastp.yaml"
+
+[[rules]]
+name = "download_sra"
+description = "Download SRA run as paired FASTQs (prefetch/fasterq-dump, ENA via ffq fallback)"
+output = [
+    "results/fastqs/{sample}/{sample}/u1/{accession}_1.fastq.gz",
+    "results/fastqs/{sample}/{sample}/u1/{accession}_2.fastq.gz",
+]
+when = "wildcard.input_type == 'srr'"
+log = "logs/download_sra/{sample}/{accession}.txt"
+shell = """
+rm -rf {accession}
+mkdir -p results/fastqs/{sample}/{sample}/u1
+
+if prefetch --max-size 1T {accession} 2>> {log}; then
+    fasterq-dump {accession} \\
+        -O results/fastqs/{sample}/{sample}/u1 \\
+        -e {threads} \\
+        >> {log} 2>&1
+    pigz -p {threads} results/fastqs/{sample}/{sample}/u1/{accession}*.fastq
+    rm -rf {accession}
+else
+    echo "Prefetch failed, trying ENA via ffq..." >> {log}
+    ffq --ftp {accession} 2>> {log} \\
+        | jq -r '.[].url' \\
+        | while IFS= read -r url; do
+            [[ -n "$url" ]] || continue
+            echo "Downloading: $url" >> {log}
+            curl -fSL "$url" \\
+                -o results/fastqs/{sample}/{sample}/u1/$(basename "$url") \\
+                >> {log} 2>&1
+        done
+fi
+
+[[ -f {output[0]} ]] && [[ -f {output[1]} ]]
+"""
+tags = ["read-acquisition"]
+
+[rules.resources]
+threads = 4
+
+[rules.environment]
+conda = "envs/sra.yaml"
+
+[[rules]]
+name = "fastp_srr"
+description = "Adapter detection and quality filtering of downloaded SRA read pairs with fastp"
+input = [
+    "results/fastqs/{sample}/{sample}/u1/{accession}_1.fastq.gz",
+    "results/fastqs/{sample}/{sample}/u1/{accession}_2.fastq.gz",
+]
+output = [
+    "results/filtered_fastqs/{sample}/{sample}/u1_1.fastq.gz",
+    "results/filtered_fastqs/{sample}/{sample}/u1_2.fastq.gz",
+    "results/fastp/{sample}/{sample}/u1.json",
+]
+when = "wildcard.input_type == 'srr'"
+log = "logs/fastp_srr/{sample}.txt"
 shell = """
 fastp \
     --in1 {input[0]} \
@@ -130,6 +267,7 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
+when = "(wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = ["results/bams/raw/{sample}/{sample}/u1.bam"]
 temp_output = ["results/bams/raw/{sample}/{sample}/u1.bam"]
 log = "logs/bwa_mem/{sample}.txt"
@@ -149,6 +287,7 @@ conda = "envs/samtools.yaml"
 name = "merge_library_bams"
 description = "Merge per-input-unit BAMs into a per-library BAM"
 input = ["results/bams/raw/{sample}/{sample}/u1.bam"]
+when = "(wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = ["results/bams/library/{sample}/{sample}.bam"]
 temp_output = ["results/bams/library/{sample}/{sample}.bam"]
 log = "logs/merge_library_bams/{sample}.txt"
@@ -162,6 +301,7 @@ conda = "envs/samtools.yaml"
 name = "merge_library_level_bams"
 description = "Merge per-library BAMs into the final sample BAM (no duplicate marking)"
 input = ["results/bams/library/{sample}/{sample}.bam"]
+when = "!config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = ["results/bams/merged/{sample}.bam"]
 log = "logs/merge_library_level_bams/{sample}.txt"
 shell = "samtools merge {output[0]} {input[0]}"
@@ -171,9 +311,53 @@ tags = ["alignment"]
 conda = "envs/samtools.yaml"
 
 [[rules]]
+name = "markdup_library"
+description = "Mark duplicate reads per library with sambamba (upstream default branch)"
+input = ["results/bams/library/{sample}/{sample}.bam"]
+when = "config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+output = ["results/bams/library_markdup/{sample}/{sample}.bam"]
+temp_output = ["results/bams/library_markdup/{sample}/{sample}.bam"]
+log = "logs/markdup/{sample}.txt"
+shell = """
+sambamba markdup -t {threads} {input[0]} {output[0]} 2> {log}
+rm -f {output[0]}.bai
+"""
+tags = ["alignment"]
+
+[rules.resources]
+threads = 4
+
+[rules.environment]
+conda = "envs/sambamba.yaml"
+
+[[rules]]
+name = "merge_dedup_libraries"
+description = "Merge duplicate-marked library BAMs into the final sample BAM"
+input = ["results/bams/library_markdup/{sample}/{sample}.bam"]
+when = "config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+output = ["results/bams/markdup/{sample}.bam"]
+log = "logs/merge_dedup_libraries/{sample}.txt"
+shell = "samtools merge {output[0]} {input[0]}"
+tags = ["alignment"]
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "stage_external_bam"
+description = "Stage an external BAM input as a symlink into the workflow's BAM tree"
+input = ["{bam_path}"]
+when = "wildcard.input_type == 'bam'"
+output = ["results/bams/input/{sample}.bam"]
+log = "logs/stage_external_bam/{sample}.txt"
+shell = "ln -sf {input[0]} {output[0]} 2> {log}"
+tags = ["alignment"]
+
+[[rules]]
 name = "index_bam_csi"
 description = "Index the final BAM with CSI (required by GATK)"
 input = ["results/bams/merged/{sample}.bam"]
+when = "!config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = ["results/bams/merged/{sample}.bam.csi"]
 log = "logs/index_bam_csi/{sample}.txt"
 shell = "samtools index -c {input[0]} {output[0]}"
@@ -182,13 +366,39 @@ tags = ["alignment"]
 [rules.environment]
 conda = "envs/samtools.yaml"
 
+[[rules]]
+name = "index_bam_csi_markdup"
+description = "Index the duplicate-marked final BAM with CSI"
+input = ["results/bams/markdup/{sample}.bam"]
+when = "config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+output = ["results/bams/markdup/{sample}.bam.csi"]
+log = "logs/index_bam_csi_markdup/{sample}.txt"
+shell = "samtools index -c {input[0]} {output[0]}"
+tags = ["alignment"]
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "index_bam_csi_external"
+description = "Index the staged external BAM with CSI"
+input = ["results/bams/input/{sample}.bam"]
+when = "wildcard.input_type == 'bam'"
+output = ["results/bams/input/{sample}.bam.csi"]
+log = "logs/index_bam_csi_external/{sample}.txt"
+shell = "samtools index -c {input[0]} {output[0]}"
+tags = ["alignment"]
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
 # ---------------------------------------------------------------------------
-# Variant calling (GATK HaplotypeCaller, per-sample gVCF)
+# Variant calling (per-sample gVCF)
 # ---------------------------------------------------------------------------
 
 [[rules]]
 name = "gatk_haplotypecaller"
-description = "Per-sample variant calling to gVCF with GATK HaplotypeCaller"
+description = "Per-sample variant calling to gVCF with GATK HaplotypeCaller (no-markdup BAM)"
 input = [
     "results/bams/merged/{sample}.bam",
     "results/bams/merged/{sample}.bam.csi",
@@ -196,6 +406,7 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
+when = "config.variant_tool == 'gatk' && !config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = [
     "results/gvcfs/{sample}.g.vcf.gz",
     "results/gvcfs/{sample}.g.vcf.gz.tbi",
@@ -222,6 +433,396 @@ threads = 1
 [rules.environment]
 conda = "envs/gatk.yaml"
 
+[[rules]]
+name = "gatk_haplotypecaller_markdup"
+description = "Per-sample variant calling to gVCF with GATK HaplotypeCaller (duplicate-marked BAM)"
+input = [
+    "results/bams/markdup/{sample}.bam",
+    "results/bams/markdup/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.variant_tool == 'gatk' && config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+output = [
+    "results/gvcfs/{sample}.g.vcf.gz",
+    "results/gvcfs/{sample}.g.vcf.gz.tbi",
+]
+log = "logs/gatk_haplotypecaller_markdup/{sample}.txt"
+shell = """
+gatk HaplotypeCaller \
+    --java-options '-Xmx7000m' \
+    -R {input[2]} \
+    -I {input[0]} \
+    --read-index {input[1]} \
+    -O {output[0]} \
+    -ploidy {config.ploidy} \
+    --native-pair-hmm-threads {threads} \
+    --emit-ref-confidence GVCF \
+    --min-pruning 1 \
+    --min-dangling-branch-length 1
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "gatk_haplotypecaller_external"
+description = "Per-sample variant calling to gVCF with GATK HaplotypeCaller (staged external BAM)"
+input = [
+    "results/bams/input/{sample}.bam",
+    "results/bams/input/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.variant_tool == 'gatk' && wildcard.input_type == 'bam'"
+output = [
+    "results/gvcfs/{sample}.g.vcf.gz",
+    "results/gvcfs/{sample}.g.vcf.gz.tbi",
+]
+log = "logs/gatk_haplotypecaller_external/{sample}.txt"
+shell = """
+gatk HaplotypeCaller \
+    --java-options '-Xmx7000m' \
+    -R {input[2]} \
+    -I {input[0]} \
+    --read-index {input[1]} \
+    -O {output[0]} \
+    -ploidy {config.ploidy} \
+    --native-pair-hmm-threads {threads} \
+    --emit-ref-confidence GVCF \
+    --min-pruning 1 \
+    --min-dangling-branch-length 1
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "deepvariant_call"
+description = "Per-sample variant calling to gVCF with DeepVariant (docker, no-markdup BAM)"
+input = [
+    "results/bams/merged/{sample}.bam",
+    "results/bams/merged/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.variant_tool == 'deepvariant' && !config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+output = [
+    "results/gvcfs/{sample}.g.vcf.gz",
+    "results/gvcfs/{sample}.g.vcf.gz.tbi",
+    "results/deepvariant/{sample}.vcf.gz",
+    "results/deepvariant/{sample}.vcf.gz.tbi",
+]
+temp_output = [
+    "results/deepvariant/{sample}.vcf.gz",
+    "results/deepvariant/{sample}.vcf.gz.tbi",
+]
+log = "logs/deepvariant_call/{sample}.txt"
+shell = """
+mkdir -p results/deepvariant/{sample}
+/opt/deepvariant/bin/run_deepvariant \
+    --ref {input[2]} \
+    --reads {input[0]} \
+    --output_vcf {output[2]} \
+    --output_gvcf {output[0]} \
+    --model_type {config.deepvariant_model_type} \
+    --num_shards {threads} \
+    --intermediate_results_dir results/deepvariant/{sample} \
+    &> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 8
+
+[rules.environment]
+docker = "google/deepvariant:1.10.0"
+
+[[rules]]
+name = "deepvariant_call_markdup"
+description = "Per-sample variant calling to gVCF with DeepVariant (docker, duplicate-marked BAM)"
+input = [
+    "results/bams/markdup/{sample}.bam",
+    "results/bams/markdup/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.variant_tool == 'deepvariant' && config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+output = [
+    "results/gvcfs/{sample}.g.vcf.gz",
+    "results/gvcfs/{sample}.g.vcf.gz.tbi",
+    "results/deepvariant/{sample}.vcf.gz",
+    "results/deepvariant/{sample}.vcf.gz.tbi",
+]
+temp_output = [
+    "results/deepvariant/{sample}.vcf.gz",
+    "results/deepvariant/{sample}.vcf.gz.tbi",
+]
+log = "logs/deepvariant_call_markdup/{sample}.txt"
+shell = """
+mkdir -p results/deepvariant/{sample}
+/opt/deepvariant/bin/run_deepvariant \
+    --ref {input[2]} \
+    --reads {input[0]} \
+    --output_vcf {output[2]} \
+    --output_gvcf {output[0]} \
+    --model_type {config.deepvariant_model_type} \
+    --num_shards {threads} \
+    --intermediate_results_dir results/deepvariant/{sample} \
+    &> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 8
+
+[rules.environment]
+docker = "google/deepvariant:1.10.0"
+
+[[rules]]
+name = "deepvariant_call_external"
+description = "Per-sample variant calling to gVCF with DeepVariant (docker, staged external BAM)"
+input = [
+    "results/bams/input/{sample}.bam",
+    "results/bams/input/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.variant_tool == 'deepvariant' && wildcard.input_type == 'bam'"
+output = [
+    "results/gvcfs/{sample}.g.vcf.gz",
+    "results/gvcfs/{sample}.g.vcf.gz.tbi",
+    "results/deepvariant/{sample}.vcf.gz",
+    "results/deepvariant/{sample}.vcf.gz.tbi",
+]
+temp_output = [
+    "results/deepvariant/{sample}.vcf.gz",
+    "results/deepvariant/{sample}.vcf.gz.tbi",
+]
+log = "logs/deepvariant_call_external/{sample}.txt"
+shell = """
+mkdir -p results/deepvariant/{sample}
+/opt/deepvariant/bin/run_deepvariant \
+    --ref {input[2]} \
+    --reads {input[0]} \
+    --output_vcf {output[2]} \
+    --output_gvcf {output[0]} \
+    --model_type {config.deepvariant_model_type} \
+    --num_shards {threads} \
+    --intermediate_results_dir results/deepvariant/{sample} \
+    &> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 8
+
+[rules.environment]
+docker = "google/deepvariant:1.10.0"
+
+# ---------------------------------------------------------------------------
+# Joint genotyping (GATK: GenomicsDB -> GenotypeGVCFs; DeepVariant: GLnexus)
+# ---------------------------------------------------------------------------
+
+[[rules]]
+name = "create_db_mapfile"
+description = "Write the GenomicsDB sample-name map from per-sample gVCF paths"
+input = []
+expand_inputs = [
+    { pattern = "results/gvcfs/{sample}.g.vcf.gz", variables = { sample = "config.samples_list" } },
+]
+when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk'"
+output = ["results/genomics_db/mapfile.txt"]
+log = "logs/create_db_mapfile.txt"
+script = "scripts/write_joint_gvcf_mapfile.py {output[0]} {input}"
+tags = ["variant-calling"]
+
+[[rules]]
+name = "joint_genomics_db_import"
+description = "Import all sample gVCFs into a GenomicsDB workspace (GATK)"
+input = [
+    "results/genomics_db/mapfile.txt",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+expand_inputs = [
+    { pattern = "results/gvcfs/{sample}.g.vcf.gz", variables = { sample = "config.samples_list" } },
+    { pattern = "results/gvcfs/{sample}.g.vcf.gz.tbi", variables = { sample = "config.samples_list" } },
+]
+when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk'"
+output = [
+    "results/gatk_genomics_db",
+    "results/gatk_genomics_db.tar",
+]
+temp_output = ["results/gatk_genomics_db"]
+log = "logs/joint_genomics_db_import.txt"
+shell = """
+: > {log}
+export TILEDB_DISABLE_FILE_LOCKING=1
+MERGE_CONTIGS_ARG=$(python scripts/interval_list_tools.py genomicsdb-merge-contigs-arg \\
+    --input {input[2]} \\
+    --threshold 50 2>> {log})
+gatk GenomicsDBImport \
+    --java-options '-Xmx7000m' \
+    --genomicsdb-shared-posixfs-optimizations true \
+    --batch-size 25 \
+    --genomicsdb-workspace-path {output[0]} \
+    --merge-input-intervals $MERGE_CONTIGS_ARG \
+    --reader-threads {threads} \
+    -L {input[2]} \
+    --sample-name-map {input[0]} \
+    &>> {log}
+tar -cf {output[1]} {output[0]} >> {log} 2>&1
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "joint_genotype_gvcfs"
+description = "Jointly genotype the cohort from the GenomicsDB workspace (GATK)"
+input = [
+    "results/gatk_genomics_db.tar",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk'"
+output = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.tbi",
+]
+temp_output = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.tbi",
+]
+log = "logs/joint_genotype_gvcfs.txt"
+shell = """
+EXTRACT_DIR=$(mktemp -d .oxo-joint-gvcf.XXXXXX)
+trap 'rm -rf "$EXTRACT_DIR"' EXIT
+tar -xf {input[0]} -C "$EXTRACT_DIR"
+gatk GenotypeGVCFs \
+    --java-options '-Xmx7000m' \
+    -R {input[1]} \
+    --heterozygosity {config.gatk_het_prior} \
+    --genomicsdb-shared-posixfs-optimizations true \
+    -V gendb://"$EXTRACT_DIR/results/gatk_genomics_db" \
+    -O {output[0]} \
+    &> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "glnexus_joint"
+description = "Jointly genotype DeepVariant gVCFs with GLnexus (DeepVariant branch)"
+input = []
+expand_inputs = [
+    { pattern = "results/gvcfs/{sample}.g.vcf.gz", variables = { sample = "config.samples_list" } },
+    { pattern = "results/gvcfs/{sample}.g.vcf.gz.tbi", variables = { sample = "config.samples_list" } },
+]
+when = "config.joint_genotyping_enabled && config.variant_tool == 'deepvariant'"
+output = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.tbi",
+]
+temp_output = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.tbi",
+]
+log = "logs/glnexus_joint.txt"
+shell = """
+glnexus_db="results/vcfs/GLnexus.DB"
+rm -rf "$glnexus_db"
+trap 'rm -rf "$glnexus_db"' EXIT
+
+glnexus_mem_gbytes=8
+if [ "$glnexus_mem_gbytes" -lt 1 ]; then
+    glnexus_mem_gbytes=1
+fi
+
+glnexus_cli --dir "$glnexus_db" --mem-gbytes "$glnexus_mem_gbytes" \\
+    --config DeepVariant --threads {threads} {input} 2> {log} \\
+    | bcftools view -Oz -o {output[0]} - 2>> {log}
+bcftools index -f -t {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/glnexus.yaml"
+
+# ---------------------------------------------------------------------------
+# GATK hard variant filtration (downstream of joint genotyping)
+# ---------------------------------------------------------------------------
+
+[[rules]]
+name = "variant_filtration"
+description = "Apply GATK hard filters (RPRS/FS_SOR/MQ/QUAL) to the joint raw VCF"
+input = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.tbi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.joint_genotyping_enabled && config.generate_filtered_vcf && config.variant_tool == 'gatk'"
+output = [
+    "results/vcfs/filtered.vcf.gz",
+    "results/vcfs/filtered.vcf.gz.tbi",
+]
+log = "logs/variant_filtration.txt"
+shell = """
+gatk VariantFiltration \
+    -R {input[2]} \
+    -V {input[0]} \
+    --output {output[0]} \
+    --filter-name "RPRS_filter" \
+    --filter-expression "(vc.isSNP() && (vc.hasAttribute('ReadPosRankSum') && ReadPosRankSum < -8.0)) || ((vc.isIndel() || vc.isMixed()) && (vc.hasAttribute('ReadPosRankSum') && ReadPosRankSum < -20.0)) || (vc.hasAttribute('QD') && QD < 2.0)" \
+    --filter-name "FS_SOR_filter" \
+    --filter-expression "(vc.isSNP() && ((vc.hasAttribute('FS') && FS > 60.0) || (vc.hasAttribute('SOR') &&  SOR > 3.0))) || ((vc.isIndel() || vc.isMixed()) && ((vc.hasAttribute('FS') && FS > 200.0) || (vc.hasAttribute('SOR') &&  SOR > 10.0)))" \
+    --filter-name "MQ_filter" \
+    --filter-expression "vc.isSNP() && ((vc.hasAttribute('MQ') && MQ < 40.0) || (vc.hasAttribute('MQRankSum') && MQRankSum < -12.5))" \
+    --filter-name "QUAL_filter" \
+    --filter-expression "QUAL < 30.0" \
+    --create-output-variant-index false \
+    --invalidate-previous-filters true \
+    &> {log}
+bcftools index -f -t {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
 # ---------------------------------------------------------------------------
 # QC metrics (fastp stats, BAM stats, combined report)
 # ---------------------------------------------------------------------------
@@ -230,6 +831,7 @@ conda = "envs/gatk.yaml"
 name = "collect_fastp_stats"
 description = "Aggregate fastp per-unit stats into a per-sample JSON"
 input = ["results/fastp/{sample}/{sample}/u1.json"]
+when = "(wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = ["results/qc_metrics/fastp/{sample}.json"]
 log = "logs/collect_fastp_stats/{sample}.txt"
 script = "scripts/collect_fastp_stats.py {input} {output}"
@@ -237,8 +839,9 @@ tags = ["qc"]
 
 [[rules]]
 name = "bam_stats"
-description = "Compute samtools coverage and flagstat metrics"
+description = "Compute samtools coverage and flagstat metrics (no-markdup BAM)"
 input = ["results/bams/merged/{sample}.bam"]
+when = "!config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = [
     "results/qc_metrics/bam/{sample}_coverage.txt",
     "results/qc_metrics/bam/{sample}_flagstat.txt",
@@ -248,6 +851,52 @@ temp_output = [
     "results/qc_metrics/bam/{sample}_flagstat.txt",
 ]
 log = "logs/bam_stats/{sample}.txt"
+shell = """
+samtools coverage {input[0]} -o {output[0]}
+samtools flagstat -O tsv {input[0]} > {output[1]}
+"""
+tags = ["qc"]
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "bam_stats_markdup"
+description = "Compute samtools coverage and flagstat metrics (duplicate-marked BAM)"
+input = ["results/bams/markdup/{sample}.bam"]
+when = "config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+output = [
+    "results/qc_metrics/bam/{sample}_coverage.txt",
+    "results/qc_metrics/bam/{sample}_flagstat.txt",
+]
+temp_output = [
+    "results/qc_metrics/bam/{sample}_coverage.txt",
+    "results/qc_metrics/bam/{sample}_flagstat.txt",
+]
+log = "logs/bam_stats_markdup/{sample}.txt"
+shell = """
+samtools coverage {input[0]} -o {output[0]}
+samtools flagstat -O tsv {input[0]} > {output[1]}
+"""
+tags = ["qc"]
+
+[rules.environment]
+conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "bam_stats_external"
+description = "Compute samtools coverage and flagstat metrics (staged external BAM)"
+input = ["results/bams/input/{sample}.bam"]
+when = "wildcard.input_type == 'bam'"
+output = [
+    "results/qc_metrics/bam/{sample}_coverage.txt",
+    "results/qc_metrics/bam/{sample}_flagstat.txt",
+]
+temp_output = [
+    "results/qc_metrics/bam/{sample}_coverage.txt",
+    "results/qc_metrics/bam/{sample}_flagstat.txt",
+]
+log = "logs/bam_stats_external/{sample}.txt"
 shell = """
 samtools coverage {input[0]} -o {output[0]}
 samtools flagstat -O tsv {input[0]} > {output[1]}
@@ -281,3 +930,676 @@ output = ["results/qc_metrics/qc_report.tsv"]
 log = "logs/combine_qc_metrics.txt"
 script = "scripts/combine_qc_metrics.py {input} {output}"
 tags = ["qc"]
+
+# ---------------------------------------------------------------------------
+# Callable sites (mosdepth/clam coverage + genmap mappability)
+# ---------------------------------------------------------------------------
+
+[[rules]]
+name = "mosdepth"
+description = "Compute per-base coverage with mosdepth (no-markdup BAM)"
+input = [
+    "results/bams/merged/{sample}.bam",
+    "results/bams/merged/{sample}.bam.csi",
+]
+when = "config.callable_sites_enabled && !config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+output = [
+    "results/callable_sites/depths/{sample}.per-base.d4",
+    "results/callable_sites/depths/{sample}.mosdepth.summary.txt",
+]
+temp_output = ["results/callable_sites/depths/{sample}.per-base.d4"]
+log = "logs/mosdepth/{sample}.txt"
+shell = """
+mosdepth --d4 -t {threads} results/callable_sites/depths/{sample} {input[0]} &> {log}
+"""
+tags = ["callable-sites"]
+
+[rules.resources]
+threads = 4
+
+[rules.environment]
+conda = "envs/mosdepth.yaml"
+
+[[rules]]
+name = "mosdepth_markdup"
+description = "Compute per-base coverage with mosdepth (duplicate-marked BAM)"
+input = [
+    "results/bams/markdup/{sample}.bam",
+    "results/bams/markdup/{sample}.bam.csi",
+]
+when = "config.callable_sites_enabled && config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+output = [
+    "results/callable_sites/depths/{sample}.per-base.d4",
+    "results/callable_sites/depths/{sample}.mosdepth.summary.txt",
+]
+temp_output = ["results/callable_sites/depths/{sample}.per-base.d4"]
+log = "logs/mosdepth_markdup/{sample}.txt"
+shell = """
+mosdepth --d4 -t {threads} results/callable_sites/depths/{sample} {input[0]} &> {log}
+"""
+tags = ["callable-sites"]
+
+[rules.resources]
+threads = 4
+
+[rules.environment]
+conda = "envs/mosdepth.yaml"
+
+[[rules]]
+name = "mosdepth_external"
+description = "Compute per-base coverage with mosdepth (staged external BAM)"
+input = [
+    "results/bams/input/{sample}.bam",
+    "results/bams/input/{sample}.bam.csi",
+]
+when = "config.callable_sites_enabled && wildcard.input_type == 'bam'"
+output = [
+    "results/callable_sites/depths/{sample}.per-base.d4",
+    "results/callable_sites/depths/{sample}.mosdepth.summary.txt",
+]
+temp_output = ["results/callable_sites/depths/{sample}.per-base.d4"]
+log = "logs/mosdepth_external/{sample}.txt"
+shell = """
+mosdepth --d4 -t {threads} results/callable_sites/depths/{sample} {input[0]} &> {log}
+"""
+tags = ["callable-sites"]
+
+[rules.resources]
+threads = 4
+
+[rules.environment]
+conda = "envs/mosdepth.yaml"
+
+[[rules]]
+name = "clam_collect"
+description = "Collect per-sample depth data from D4 files into a Zarr store"
+input = []
+expand_inputs = [
+    { pattern = "results/callable_sites/depths/{sample}.per-base.d4", variables = { sample = "config.samples_list" } },
+]
+when = "config.callable_sites_enabled"
+output = ["results/callable_sites/depths.zarr"]
+temp_output = ["results/callable_sites/depths.zarr"]
+log = "logs/clam_collect.txt"
+shell = """
+clam collect \
+    -o {output[0]} \
+    -t {threads} \
+    {input} \
+    &> {log}
+"""
+tags = ["callable-sites"]
+
+[rules.resources]
+threads = 8
+
+[rules.environment]
+conda = "envs/clam.yaml"
+
+[[rules]]
+name = "callable_coverage_thresholds"
+description = "Calculate cohort-wide coverage thresholds for callable loci"
+input = []
+expand_inputs = [
+    { pattern = "results/callable_sites/depths/{sample}.mosdepth.summary.txt", variables = { sample = "config.samples_list" } },
+]
+when = "config.callable_sites_enabled"
+output = ["results/callable_sites/coverage_thresholds.tsv"]
+log = "logs/callable_coverage_thresholds.txt"
+script = "scripts/callable_coverage_thresholds.py --min-coverage {config.callable_sites_min_coverage} --max-coverage {config.callable_sites_max_coverage} --output {output[0]} {input}"
+tags = ["callable-sites"]
+
+[rules.environment]
+conda = "envs/callable_sites.yaml"
+
+[[rules]]
+name = "clam_loci"
+description = "Identify callable loci based on coverage"
+input = [
+    "results/callable_sites/depths.zarr",
+    "results/callable_sites/coverage_thresholds.tsv",
+]
+when = "config.callable_sites_enabled"
+output = ["results/callable_sites/callable_loci.zarr"]
+temp_output = ["results/callable_sites/callable_loci.zarr"]
+log = "logs/clam_loci.txt"
+shell = """
+min_depth=$(awk -F '\t' 'NR==2 {print $2}' {input[1]})
+max_depth=$(awk -F '\t' 'NR==2 {print $3}' {input[1]})
+clam loci \
+    -o {output[0]} \
+    -t {threads} \
+    --per-sample \
+    -m "$min_depth" \
+    -M "$max_depth" \
+    {input[0]} \
+    &> {log}
+"""
+tags = ["callable-sites"]
+
+[rules.resources]
+threads = 8
+
+[rules.environment]
+conda = "envs/clam.yaml"
+
+[[rules]]
+name = "coverage_bed"
+description = "Create BED of callable regions based on coverage"
+input = ["results/callable_sites/callable_loci.zarr"]
+when = "config.callable_sites_enabled"
+output = ["results/callable_sites/coverage.bed"]
+log = "logs/coverage_bed.txt"
+script = "scripts/callable_zarr_to_bed.py {input[0]} {output[0]} --fraction {config.callable_sites_fraction} --merge-distance {config.callable_sites_merge_distance}"
+tags = ["callable-sites"]
+
+[rules.environment]
+conda = "envs/callable_sites.yaml"
+
+[[rules]]
+name = "genmap_index"
+description = "Create genmap index for mappability calculation"
+input = ["results/reference/{config.reference_name}.fa.gz"]
+when = "config.callable_sites_enabled"
+output = ["results/callable_sites/genmap_index"]
+log = "logs/genmap_index.txt"
+shell = """
+set -euo pipefail
+
+REF_FASTA="results/callable_sites/reference.decompressed.fa"
+trap 'rm -f "$REF_FASTA"' EXIT
+
+gunzip -c "{input[0]}" > "$REF_FASTA"
+SIZE_BYTES=$(wc -c < "$REF_FASTA" | tr -d '[:space:]')
+
+: > "{log}"
+echo "Decompressed FASTA size (bytes): $SIZE_BYTES" >> "{log}"
+
+if (( SIZE_BYTES > 5368709120 )); then
+    # >= 5 GB: skew index mode (upstream GENMAP_SKEW_THRESHOLD_BYTES)
+    echo "GenMap index mode: skew (-A skew)" >> "{log}"
+    genmap index -F "$REF_FASTA" -I "{output[0]}" -A skew >> "{log}" 2>&1
+elif (( SIZE_BYTES > 2147483648 )); then
+    # >= 2 GB: sampled index mode (upstream GENMAP_SAMPLING_THRESHOLD_BYTES, value 20)
+    echo "GenMap index mode: sampled (-S 20)" >> "{log}"
+    genmap index -F "$REF_FASTA" -I "{output[0]}" -S 20 >> "{log}" 2>&1
+else
+    echo "GenMap index mode: default (divsufsort)" >> "{log}"
+    genmap index -F "$REF_FASTA" -I "{output[0]}" >> "{log}" 2>&1
+fi
+"""
+tags = ["callable-sites"]
+
+[rules.environment]
+conda = "envs/genmap.yaml"
+
+[[rules]]
+name = "genmap_mappability"
+description = "Compute mappability scores with genmap"
+input = ["results/callable_sites/genmap_index"]
+when = "config.callable_sites_enabled"
+output = ["results/callable_sites/mappability.bedgraph"]
+log = "logs/genmap_mappability.txt"
+shell = """
+genmap map \
+    -K {config.callable_sites_kmer} \
+    -E 2 \
+    -I {input[0]} \
+    -O results/callable_sites/mappability \
+    -bg \
+    -T {threads} \
+    &> {log}
+"""
+tags = ["callable-sites"]
+
+[rules.resources]
+threads = 4
+
+[rules.environment]
+conda = "envs/genmap.yaml"
+
+[[rules]]
+name = "mappability_bed"
+description = "Create BED of high-mappability regions"
+input = ["results/callable_sites/mappability.bedgraph"]
+when = "config.callable_sites_enabled"
+output = ["results/callable_sites/mappability.bed"]
+log = "logs/mappability_bed.txt"
+shell = """
+awk -v min={config.callable_sites_min_score} '$4 >= min {print $1"\\t"$2"\\t"$3}' {input[0]} 2> {log} \
+    | bedtools sort -i - 2>> {log} \
+    | bedtools merge -d {config.callable_sites_merge_distance} -i - > {output[0]} 2>> {log}
+"""
+tags = ["callable-sites"]
+
+[rules.environment]
+conda = "envs/bedtools.yaml"
+
+[[rules]]
+name = "callable_sites_bed"
+description = "Combine coverage and mappability BEDs into the final callable-sites BED"
+input = [
+    "results/callable_sites/coverage.bed",
+    "results/callable_sites/mappability.bed",
+]
+when = "config.callable_sites_enabled"
+output = ["results/callable_sites/callable_sites.bed"]
+log = "logs/callable_sites_bed.txt"
+shell = """
+cat {input[0]} {input[1]} 2> {log} \
+    | bedtools sort -i - 2>> {log} \
+    | bedtools merge -i - > {output[0]} 2>> {log}
+"""
+tags = ["callable-sites"]
+
+[rules.environment]
+conda = "envs/bedtools.yaml"
+
+# ---------------------------------------------------------------------------
+# Postprocess module (filtered / clean-SNP / clean-indel VCFs)
+# Consumes the joint raw VCF (results/vcfs/raw.vcf.gz). Upstream consumes
+# FINAL_VCF (hard-filtered for GATK when generate_filtered_vcf=true); see
+# README fidelity table.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+name = "postprocess_filter_individuals"
+description = "Write the list of samples to include in downstream filtering"
+input = []
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled"
+output = ["results/postprocess/include_samples.txt"]
+log = "logs/postprocess/filter_individuals.txt"
+script = "scripts/write_include_samples.py {output[0]} {config.samples_list}"
+tags = ["postprocess"]
+
+[[rules]]
+name = "postprocess_basic_filter"
+description = "Remove excluded individuals, sites failing filters, ref=N, alt=., and AF==0"
+input = [
+    "results/vcfs/raw.vcf.gz",
+    "results/postprocess/include_samples.txt",
+]
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled"
+output = [
+    "results/postprocess/basic.vcf.gz",
+    "results/postprocess/basic.vcf.gz.tbi",
+]
+temp_output = [
+    "results/postprocess/basic.vcf.gz",
+    "results/postprocess/basic.vcf.gz.tbi",
+]
+shell = """
+bcftools view -S {input[1]} -f .,PASS {input[0]} -a -U -O u \\
+    | bcftools +fill-tags -Ou \\
+    | bcftools view -m2 -e 'AF==0 | ref="N" | ALT="."' -O z -o {output[0]}
+bcftools index -f -t {output[0]}
+"""
+tags = ["postprocess"]
+
+[rules.environment]
+conda = "envs/postprocess_filter.yaml"
+
+[[rules]]
+name = "postprocess_update_bed"
+description = "Refine callable-sites BED: remove regions on contigs smaller than the configured threshold"
+input = [
+    "results/callable_sites/callable_sites.bed",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+]
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled"
+output = [
+    "results/postprocess/callable_sites_filtered.bed",
+    "results/postprocess/small_contigs.bed",
+]
+temp_output = ["results/postprocess/small_contigs.bed"]
+log = "logs/postprocess/update_bed.txt"
+shell = """
+awk 'BEGIN{OFS="\\t"}{if ($2<{config.postprocess_contig_size}) {print $1,0,$2}}' \\
+    {input[1]} > {output[1]}
+bedtools subtract -a {input[0]} -b {output[1]} \\
+    | bedtools sort -i - \\
+    | bedtools merge -i - > {output[0]}
+"""
+tags = ["postprocess"]
+
+[rules.environment]
+conda = "envs/postprocess_bed.yaml"
+
+[[rules]]
+name = "postprocess_strict_filter"
+description = "Apply missingness, MAF, and scaffold-exclusion filters, restricted to callable regions"
+input = [
+    "results/postprocess/callable_sites_filtered.bed",
+    "results/postprocess/basic.vcf.gz",
+    "results/postprocess/basic.vcf.gz.tbi",
+]
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled"
+output = [
+    "results/postprocess/filtered.vcf.gz",
+    "results/postprocess/filtered.vcf.gz.tbi",
+]
+log = "logs/postprocess/strict_filter.txt"
+shell = """
+UPPER_BOUND=$(awk -v m="{config.postprocess_maf}" 'BEGIN { printf "%.6g", 1-m }')
+if [ -z "{config.postprocess_exclude_scaffolds}" ]
+then
+    bcftools view -R {input[0]} -m2 -M2 \\
+        -e "F_MISSING > {config.postprocess_missingness} | AF<{config.postprocess_maf} | AF>$UPPER_BOUND" \\
+        {input[1]} -O z -o {output[0]}
+else
+    bcftools view -t ^{config.postprocess_exclude_scaffolds} -R {input[0]} -m2 -M2 \\
+        -e "F_MISSING > {config.postprocess_missingness} | AF<{config.postprocess_maf} | AF>$UPPER_BOUND" \\
+        {input[1]} -O z -o {output[0]}
+fi
+bcftools index -f -t {output[0]}
+"""
+tags = ["postprocess"]
+
+[rules.environment]
+conda = "envs/postprocess_filter.yaml"
+
+[[rules]]
+name = "postprocess_subset_indels"
+description = "Extract clean indels from the strictly-filtered VCF"
+input = [
+    "results/postprocess/filtered.vcf.gz",
+    "results/postprocess/filtered.vcf.gz.tbi",
+]
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled"
+output = [
+    "results/postprocess/clean_indels.vcf.gz",
+    "results/postprocess/clean_indels.vcf.gz.tbi",
+]
+log = "logs/postprocess/subset_indels.txt"
+shell = """
+bcftools view -v indels -O z -o {output[0]} {input[0]}
+bcftools index -f -t {output[0]}
+"""
+tags = ["postprocess"]
+
+[rules.environment]
+conda = "envs/postprocess_filter.yaml"
+
+[[rules]]
+name = "postprocess_subset_snps"
+description = "Extract SNPs (excluding indel-overlapping sites) from the strictly-filtered VCF"
+input = [
+    "results/postprocess/filtered.vcf.gz",
+    "results/postprocess/filtered.vcf.gz.tbi",
+]
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled"
+output = [
+    "results/postprocess/clean_snps_prefilter.vcf.gz",
+    "results/postprocess/clean_snps_prefilter.vcf.gz.tbi",
+]
+temp_output = [
+    "results/postprocess/clean_snps_prefilter.vcf.gz",
+    "results/postprocess/clean_snps_prefilter.vcf.gz.tbi",
+]
+log = "logs/postprocess/subset_snps.txt"
+shell = """
+bcftools view -v snps -e 'TYPE ~ "indel"' -O z -o {output[0]} {input[0]}
+bcftools index -f -t {output[0]}
+"""
+tags = ["postprocess"]
+
+[rules.environment]
+conda = "envs/postprocess_filter.yaml"
+
+[[rules]]
+name = "postprocess_drop_indel_snps"
+description = "Remove SNPs that overlap indels (genotype length > 1)"
+input = [
+    "results/postprocess/clean_snps_prefilter.vcf.gz",
+    "results/postprocess/clean_snps_prefilter.vcf.gz.tbi",
+]
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled"
+output = [
+    "results/postprocess/keep_snp_positions.txt",
+    "results/postprocess/clean_snps.vcf.gz",
+    "results/postprocess/clean_snps.vcf.gz.tbi",
+]
+temp_output = ["results/postprocess/keep_snp_positions.txt"]
+log = "logs/postprocess/drop_indel_snps.txt"
+shell = """
+bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\n' {input[0]} \\
+    | awk 'length($3) == 1 {print $1"\\t"$2}' \\
+    | bgzip -c > {output[0]}
+tabix -s1 -b2 -e2 {output[0]}
+bcftools view -T {output[0]} {input[0]} -Oz -o {output[1]}
+bcftools index -f -t {output[1]}
+"""
+tags = ["postprocess"]
+
+[rules.environment]
+conda = "envs/postprocess_filter.yaml"
+
+# ---------------------------------------------------------------------------
+# QC module (PCA, admixture, NJ tree, relatedness dashboard)
+# Consumes the joint raw VCF (results/vcfs/raw.vcf.gz). Upstream consumes
+# FINAL_VCF; see README fidelity table.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+name = "qc_contig_map"
+description = "Generate a QC-local contig map for PLINK and ADMIXTURE"
+input = ["results/reference/{config.reference_name}.fa.gz.fai"]
+when = "config.modules_qc_enabled"
+output = ["results/qc/contig_map.tsv"]
+log = "logs/qc/contig_map.txt"
+script = "scripts/contig_map.py {input[0]} {output[0]}"
+tags = ["qc-module"]
+
+[[rules]]
+name = "qc_vcftools_individuals"
+description = "Compute per-individual depth, missingness, het, and filter summary"
+input = ["results/vcfs/raw.vcf.gz"]
+when = "config.modules_qc_enabled"
+output = [
+    "results/qc/individuals.idepth",
+    "results/qc/individuals.imiss",
+    "results/qc/individuals.samps.txt",
+    "results/qc/individuals.FILTER.summary",
+    "results/qc/individuals.het",
+]
+log = "logs/qc/vcftools_individuals.txt"
+script = "scripts/vcftools_individuals.py {input[0]} results/qc/individuals {config.qc_min_depth} {log} {output[0]} {output[1]} {output[2]} {output[3]} {output[4]}"
+tags = ["qc-module"]
+
+[rules.environment]
+conda = "envs/qc_vcftools.yaml"
+
+[[rules]]
+name = "qc_subsample_snps"
+description = "Filter VCF to biallelic SNPs, remove low-quality sites, then prune to ~100k SNPs"
+input = [
+    "results/vcfs/raw.vcf.gz",
+    "results/qc/individuals.samps.txt",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+]
+when = "config.modules_qc_enabled"
+output = [
+    "results/qc/filtered.vcf.gz",
+    "results/qc/pruned.vcf.gz",
+    "results/qc/snpqc.txt",
+]
+temp_output = ["results/qc/filtered.vcf.gz"]
+log = "logs/qc/subsample_snps.txt"
+shell = """
+## Remove filtered sites, retain only biallelic SNPs
+## Also remove MAF < 0.01, >75% missing, indels, ref=N
+if [ -z "{config.qc_exclude_scaffolds}" ]
+then
+    bcftools view -S {input[1]} -v snps -m2 -M2 -f .,PASS \\
+        -e 'AF==1 | AF==0 | AF<0.01 | ALT="*" | F_MISSING > 0.75 | TYPE~"indel" | ref="N"' \\
+        {input[0]} -O z -o {output[0]} &> {log}
+else
+    bcftools view -S {input[1]} -t ^{config.qc_exclude_scaffolds} -v snps -m2 -M2 -f .,PASS \\
+        -e 'AF==1 | AF==0 | AF<0.01 | ALT="*" | F_MISSING > 0.75 | TYPE~"indel" | ref="N"' \\
+        {input[0]} -O z -o {output[0]} &> {log}
+fi
+bcftools index {output[0]} >> {log} 2>&1
+
+# Figure out window size to get ~100k SNPs
+ALLSITES=$(bcftools query -f '%CHROM\\t%POS\\n' {output[0]} | wc -l)
+SITES=$(( ALLSITES / 100000 ))
+
+# If < 150k SNPs, take all; otherwise prune
+if [[ $SITES -gt 1 ]]
+then
+    bcftools +prune -w $SITES -n 1 -N rand -O z -o {output[1]} {output[0]} >> {log} 2>&1
+else
+    bcftools view -O z -o {output[1]} {output[0]} >> {log} 2>&1
+fi
+
+bcftools query --allow-undef-tags -f '%CHROM\\t%POS\\t%ID\\t%INFO/AF\\t%QUAL\\t%INFO/ReadPosRankSum\\t%INFO/FS\\t%INFO/SOR\\t%INFO/MQ\\t%INFO/MQRankSum\\n' \\
+    {output[1]} > {output[2]} 2>> {log}
+"""
+tags = ["qc-module"]
+
+[rules.environment]
+conda = "envs/qc_subsample.yaml"
+
+[[rules]]
+name = "qc_prepare_plink_inputs"
+description = "Normalize QC-local contig labels for PLINK and copy the matching FAI"
+input = [
+    "results/qc/pruned.vcf.gz",
+    "results/qc/contig_map.tsv",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+]
+when = "config.modules_qc_enabled"
+output = [
+    "results/qc/plink_input.vcf.gz",
+    "results/qc/plink_input.vcf.gz.tbi",
+    "results/qc/ref.fai",
+]
+log = "logs/qc/prepare_plink_inputs.txt"
+script = "scripts/prepare_plink_inputs.py {input[0]} {input[1]} {input[2]} {output[0]} {output[2]} {log}"
+tags = ["qc-module"]
+
+[rules.environment]
+conda = "envs/qc_subsample.yaml"
+
+[[rules]]
+name = "qc_copy_qc_report"
+description = "Copy the BAM summary stats TSV into the QC folder for the dashboard"
+input = ["results/qc_metrics/qc_report.tsv"]
+when = "config.modules_qc_enabled"
+output = ["results/qc/qc_report.tsv"]
+log = "logs/qc/copy_qc_report.txt"
+shell = "cp {input[0]} {output[0]}"
+tags = ["qc-module"]
+
+[[rules]]
+name = "qc_plink"
+description = "Run PCA, distance matrix, and KING relatedness via plink"
+input = [
+    "results/qc/plink_input.vcf.gz",
+    "results/qc/plink_input.vcf.gz.tbi",
+]
+when = "config.modules_qc_enabled"
+output = [
+    "results/qc/plink.bed",
+    "results/qc/plink.bim",
+    "results/qc/plink.fam",
+    "results/qc/plink.eigenvec",
+    "results/qc/plink.eigenval",
+    "results/qc/plink.dist",
+    "results/qc/plink.dist.id",
+    "results/qc/plink.king",
+]
+log = "logs/qc/plink.txt"
+shell = """
+plink2 --vcf {input[0]} --pca 10 --out results/qc/plink \\
+    --vcf-half-call missing \\
+    --mind {config.qc_max_sample_missingness} \\
+    --allow-extra-chr --autosome-num 95 --make-bed --make-king square \\
+    --const-fid --bad-freqs &> {log}
+plink --vcf {input[0]} --out results/qc/plink \\
+    --vcf-half-call missing \\
+    --mind {config.qc_max_sample_missingness} \\
+    --allow-extra-chr --autosome-num 95 --distance square \\
+    --const-fid &>> {log}
+"""
+tags = ["qc-module"]
+
+[rules.environment]
+conda = "envs/qc_plink.yaml"
+
+[[rules]]
+name = "qc_setup_admixture"
+description = "Back up the PLINK .bim and remap contig names to the integer IDs ADMIXTURE requires"
+input = [
+    "results/qc/plink.bim",
+    "results/qc/contig_map.tsv",
+]
+when = "config.modules_qc_enabled"
+output = [
+    "results/qc/plink.bim_fixed",
+    "results/qc/plink.bim.orig",
+]
+log = "logs/qc/setup_admixture.txt"
+script = "scripts/contigs4admixture.py {input[1]} {input[0]} {output[0]}"
+tags = ["qc-module"]
+
+[[rules]]
+name = "qc_admixture"
+description = "Run ADMIXTURE for K=2 and K=3"
+input = [
+    "results/qc/plink.bed",
+    "results/qc/plink.bim",
+    "results/qc/plink.fam",
+    "results/qc/plink.bim_fixed",
+    "results/qc/plink.bim.orig",
+]
+when = "config.modules_qc_enabled"
+output = [
+    "results/qc/plink.3.Q",
+    "results/qc/plink.2.Q",
+]
+log = "logs/qc/admixture.txt"
+shell = """
+cp {input[3]} {input[1]} 2> {log}
+
+admixture {input[0]} 2 &>> {log}
+admixture {input[0]} 3 &>> {log}
+
+mv plink.2.* results/qc &>> {log}
+mv plink.3.* results/qc &>> {log}
+"""
+tags = ["qc-module"]
+
+[rules.environment]
+conda = "envs/qc_admixture.yaml"
+
+[[rules]]
+name = "qc_dashboard"
+description = "Render the interactive QC dashboard"
+input = [
+    "results/qc/plink.eigenvec",
+    "results/qc/plink.eigenval",
+    "results/qc/individuals.idepth",
+    "results/qc/plink.dist",
+    "results/qc/plink.dist.id",
+    "results/qc/plink.king",
+    "results/qc/individuals.imiss",
+    "results/qc/plink.3.Q",
+    "results/qc/plink.2.Q",
+    "results/qc/snpqc.txt",
+    "results/qc/plink.bed",
+    "results/qc/plink.bim",
+    "results/qc/plink.fam",
+    "results/qc/individuals.FILTER.summary",
+    "results/qc/individuals.het",
+    "results/qc/ref.fai",
+    "results/qc/qc_report.tsv",
+]
+when = "config.modules_qc_enabled"
+output = ["results/qc/qc_dashboard.html"]
+log = "logs/qc/qc_dashboard.txt"
+script = "scripts/qc_dashboard_render.R results/qc {config.qc_clusters} {config.qc_google_api_key} true scripts/qc_dashboard_interactive.Rmd {output[0]}"
+tags = ["qc-module"]
+
+[rules.environment]
+conda = "envs/qc_dashboard.yaml"

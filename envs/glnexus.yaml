@@ -1,0 +1,8 @@
+name: glnexus
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - glnexus>=1.4
+  - bcftools>=1.19
+  - htslib>=1.19

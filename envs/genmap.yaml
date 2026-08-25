@@ -1,0 +1,6 @@
+name: genmap
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - genmap>=1.3
