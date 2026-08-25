@@ -1,0 +1,6 @@
+name: clam
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - clam>=1.1

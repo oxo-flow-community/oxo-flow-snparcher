@@ -1,0 +1,6 @@
+name: qc_admixture
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - admixture

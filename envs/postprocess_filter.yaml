@@ -1,0 +1,6 @@
+name: postprocess_filter
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bcftools=1.23

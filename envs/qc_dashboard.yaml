@@ -1,0 +1,15 @@
+name: qc_dashboard
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - r-base>=4.1,<5
+  - r-tidyverse
+  - r-plotly
+  - r-flexdashboard
+  - r-rmarkdown
+  - r-ape
+  - r-reshape2
+  - bioconductor-ggtree
+  - r-ggmap
+  - r-ggplot2

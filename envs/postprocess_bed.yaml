@@ -1,0 +1,6 @@
+name: postprocess_bed
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bedtools

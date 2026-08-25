@@ -1,0 +1,7 @@
+name: qc_plink
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - plink2
+  - plink

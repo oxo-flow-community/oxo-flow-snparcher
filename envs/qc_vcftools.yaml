@@ -1,0 +1,7 @@
+name: qc_vcftools
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bcftools=1.23
+  - vcftools=0.1.16
