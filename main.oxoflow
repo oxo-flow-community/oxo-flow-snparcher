@@ -1475,7 +1475,7 @@ input = [
 when = "config.modules_qc_enabled"
 output = [
     "results/qc/plink_input.vcf.gz",
-    "results/qc/plink_input.vcf.gz.tbi",
+    "results/qc/plink_input.vcf.gz.csi",
     "results/qc/ref.fai",
 ]
 log = "logs/qc/prepare_plink_inputs.txt"
@@ -1500,7 +1500,7 @@ name = "qc_plink"
 description = "Run PCA, distance matrix, and KING relatedness via plink"
 input = [
     "results/qc/plink_input.vcf.gz",
-    "results/qc/plink_input.vcf.gz.tbi",
+    "results/qc/plink_input.vcf.gz.csi",
 ]
 when = "config.modules_qc_enabled"
 output = [
