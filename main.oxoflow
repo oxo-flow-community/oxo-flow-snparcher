@@ -291,7 +291,7 @@ when = "(wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = ["results/bams/library/{sample}/{sample}.bam"]
 temp_output = ["results/bams/library/{sample}/{sample}.bam"]
 log = "logs/merge_library_bams/{sample}.txt"
-shell = "samtools merge {output[0]} {input[0]}"
+shell = "samtools merge -f {output[0]} {input[0]}"
 tags = ["alignment"]
 
 [rules.environment]
@@ -304,7 +304,7 @@ input = ["results/bams/library/{sample}/{sample}.bam"]
 when = "!config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = ["results/bams/merged/{sample}.bam"]
 log = "logs/merge_library_level_bams/{sample}.txt"
-shell = "samtools merge {output[0]} {input[0]}"
+shell = "samtools merge -f {output[0]} {input[0]}"
 tags = ["alignment"]
 
 [rules.environment]
@@ -337,7 +337,7 @@ input = ["results/bams/library_markdup/{sample}/{sample}.bam"]
 when = "config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = ["results/bams/markdup/{sample}.bam"]
 log = "logs/merge_dedup_libraries/{sample}.txt"
-shell = "samtools merge {output[0]} {input[0]}"
+shell = "samtools merge -f {output[0]} {input[0]}"
 tags = ["alignment"]
 
 [rules.environment]
