@@ -61,6 +61,7 @@ qc_min_depth = 2
 qc_max_sample_missingness = 0.49
 qc_exclude_scaffolds = ""
 qc_clusters = 3
+qc_pca_dims = 10
 qc_google_api_key = ""
 
 [defaults]
@@ -1515,7 +1516,7 @@ output = [
 ]
 log = "logs/qc/plink.txt"
 shell = """
-plink2 --vcf {input[0]} --pca 10 --out results/qc/plink \\
+plink2 --vcf {input[0]} --pca {config.qc_pca_dims} --memory {effective_memory_mb} --out results/qc/plink \\
     --vcf-half-call missing \\
     --mind {config.qc_max_sample_missingness} \\
     --allow-extra-chr --autosome-num 95 --make-bed --make-king square \\
