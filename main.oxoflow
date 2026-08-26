@@ -93,7 +93,7 @@ memory = "8G"
 
 [[sample_groups]]
 name = "cohort"
-samples = ["sample1", "sample2"]
+samples = ["sample1", "sample2", "sample3"]
 metadata = { input_type = "fastq" }
 
 # ---------------------------------------------------------------------------
