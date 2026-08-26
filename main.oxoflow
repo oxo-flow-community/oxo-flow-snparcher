@@ -673,6 +673,10 @@ log = "logs/joint_genomics_db_import.txt"
 shell = """
 : > {log}
 export TILEDB_DISABLE_FILE_LOCKING=1
+# Upstream passes the .fai as -L, which GATK 4.x rejects ("does not
+# contain Features"). Translate the intent — import every reference
+# contig — into a bare contig-name list, which GATK accepts natively.
+cut -f1 {input[2]} > results/reference/contigs.list
 MERGE_CONTIGS_ARG=$(python scripts/interval_list_tools.py genomicsdb-merge-contigs-arg \\
     --input {input[2]} \\
     --threshold 50 2>> {log})
@@ -683,7 +687,7 @@ gatk GenomicsDBImport \
     --genomicsdb-workspace-path {output[0]} \
     --merge-input-intervals $MERGE_CONTIGS_ARG \
     --reader-threads {threads} \
-    -L {input[2]} \
+    -L results/reference/contigs.list \
     --sample-name-map {input[0]} \
     &>> {log}
 tar -cf {output[1]} {output[0]} >> {log} 2>&1
