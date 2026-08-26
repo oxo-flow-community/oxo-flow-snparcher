@@ -112,8 +112,8 @@ runs the same 12 rules the port has always run (upstream defaults: both ON).
 | `joint_genotyping_enabled` | `false` | GATK `create_db_mapfile` → `joint_genomics_db_import` → `joint_genotype_gvcfs`; for DeepVariant: `glnexus_joint` (upstream default `true`) |
 | `generate_filtered_vcf` | `false` | `variant_filtration` GATK hard filters (upstream default `true`) |
 | `callable_sites_enabled` | `false` | `mosdepth*`/clam coverage + genmap mappability → `callable_sites.bed` (upstream default `true`) |
-| `modules_postprocess_enabled` | `false` | postprocess module (upstream default `false`; requires callable sites) |
-| `modules_qc_enabled` | `false` | qc module (upstream default `false`) |
+| `modules_postprocess_enabled` | `false` | postprocess module (upstream default `false`; requires callable sites + joint genotyping) |
+| `modules_qc_enabled` | `false` | qc module (upstream default `false`; requires joint genotyping — consumes the joint VCF) |
 | `intervals_enabled` | `false` | not ported — see Fidelity (upstream default `true`) |
 
 Parameter keys (`gatk_het_prior`, `deepvariant_model_type`,
