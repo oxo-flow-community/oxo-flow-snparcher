@@ -1603,7 +1603,12 @@ input = [
 when = "config.modules_qc_enabled"
 output = ["results/qc/qc_dashboard.html"]
 log = "logs/qc/qc_dashboard.txt"
-script = "scripts/qc_dashboard_render.R results/qc {config.qc_clusters} {config.qc_google_api_key} true scripts/qc_dashboard_interactive.Rmd {output[0]}"
+shell = """
+# The engine drops empty script args; keep the (possibly empty) API key as a
+# quoted shell variable so Rscript always receives all six arguments.
+GOOGLE_API_KEY="{config.qc_google_api_key}"
+Rscript scripts/qc_dashboard_render.R results/qc {config.qc_clusters} "$GOOGLE_API_KEY" true scripts/qc_dashboard_interactive.Rmd {output[0]}
+"""
 tags = ["qc-module"]
 
 [rules.environment]
