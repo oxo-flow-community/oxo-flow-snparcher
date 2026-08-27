@@ -9,6 +9,10 @@
 # is unchanged; flip a key to activate a branch — see README fidelity table):
 #   mark_duplicates=true        sambamba markdup + merge (upstream default true)
 #   variant_tool='deepvariant'  DeepVariant per-sample gVCF calling (docker)
+#   variant_tool='bcftools'     bcftools mpileup+call caller (runtime-region
+#                               fan-out via output_pattern, engine >= 0.17)
+#   intervals_enabled=true      GATK interval scatter (SplitIntervals fan-out
+#                               via output_pattern, engine >= 0.17)
 #   joint_genotyping_enabled=true   GATK GenomicsDBImport + GenotypeGVCFs
 #                               (deepvariant: GLnexus joint genotyping)
 #   generate_filtered_vcf=true  GATK hard variant filtration (needs joint VCF)
@@ -20,12 +24,12 @@
 #   fastp), 'bam' (stage external BAM), or 'gvcf' (external gVCF, normalized
 #   straight into joint genotyping) — set in [[sample_groups]] metadata
 #
-# Structural exclusions (impossible in the oxo-flow static DAG — see README):
-#   interval scatter (snakemake checkpoints create_gvcf_intervals /
-#   create_db_intervals enumerate the per-interval files at runtime),
-#   bcftools caller (bcftools_regions checkpoint enumerates reference
-#   contigs at runtime), parabricks (GPU --nv passthrough + NVIDIA
-#   license), sentieon (proprietary license)
+# Remaining structural exclusions (impossible in oxo-flow — see README):
+#   parabricks (GPU --nv passthrough + NVIDIA license), sentieon
+#   (proprietary license). The snakemake checkpoint fan-outs (interval
+#   scatter, bcftools regions) are ported with the engine's output_pattern
+#   primitive; see the "Interval scatter (GATK)" and "bcftools caller"
+#   sections below.
 
 [workflow]
 name = "snparcher"
@@ -40,6 +44,15 @@ expected_coverage = "low"
 ploidy = 2
 mark_duplicates = false
 intervals_enabled = false
+intervals_scatter_count = 50
+intervals_db_scatter_factor = 0.15
+intervals_min_nmer = 500
+intervals_min_contig_length = 0
+intervals_db_max_intervals_per_shard = 200
+intervals_db_max_contigs_per_shard = 200
+bcftools_min_mapq = 20
+bcftools_min_baseq = 20
+bcftools_max_depth = 250
 variant_tool = "gatk"
 joint_genotyping_enabled = false
 generate_filtered_vcf = false
@@ -423,6 +436,401 @@ tags = ["variant-calling"]
 conda = "envs/bcftools.yaml"
 
 # ---------------------------------------------------------------------------
+# Interval scatter (GATK, gated by intervals_enabled)
+#
+# Port of upstream's checkpoint-based interval fan-out (workflow/rules/
+# intervals.smk:59,89 + variant_calling/gatk_intervals.smk) on the engine's
+# output_pattern primitive: SplitIntervals output names are unknown until the
+# run, so the splitter is an output_pattern producer and every per-interval
+# rule below is a deferred consumer instantiated once per discovered file.
+#
+# Upstream splits ONCE per cohort; oxo-flow's output_pattern domain carries
+# the instance bindings of its producer, so the gVCF splitter fans out per
+# sample to give the per-(sample, interval) HaplotypeCaller instances their
+# sample dimension. SplitIntervals is deterministic, so every sample gets an
+# identical copy of the interval set (deviation: N-1 redundant tiny runs).
+# The DB splitter stays cohort-level (its consumers are per-interval, not
+# per-sample) and uses a separate wildcard {db_interval}: one fresh wildcard
+# may have only one producer (v1).
+# ---------------------------------------------------------------------------
+
+[[rules]]
+name = "picard_intervals"
+description = "Split the reference into N-mers with picard ScatterIntervalsByNs (interval mode)"
+input = [
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.intervals_enabled && config.variant_tool == 'gatk'"
+output = ["results/intervals/picard.interval_list"]
+log = "logs/intervals_picard.txt"
+shell = """
+picard ScatterIntervalsByNs \
+    -Xmx7000m \
+    REFERENCE={input[0]} \
+    OUTPUT={output[0]} \
+    MAX_TO_MERGE={config.intervals_min_nmer} \
+    OUTPUT_TYPE=ACGT \
+    &> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "filter_picard_intervals"
+description = "Drop intervals on contigs shorter than the configured minimum (interval mode)"
+input = ["results/intervals/picard.interval_list"]
+when = "config.intervals_enabled && config.variant_tool == 'gatk'"
+output = ["results/intervals/filtered.interval_list"]
+log = "logs/intervals_filter.txt"
+script = "python scripts/interval_list_tools.py filter --input {input[0]} --output {output[0]} --min-contig-length {config.intervals_min_contig_length} &> {log}"
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "create_gvcf_intervals"
+description = "Split the filtered interval list into scatter intervals (gVCF mode, output_pattern producer)"
+input = [
+    "results/intervals/filtered.interval_list",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.intervals_enabled && config.variant_tool == 'gatk' && wildcard.input_type != 'gvcf'"
+output_pattern = "results/intervals/gvcf/{sample}/{interval}-scattered.interval_list"
+log = "logs/create_gvcf_intervals/{sample}.txt"
+shell = """
+mkdir -p results/intervals/gvcf/{sample}
+gatk SplitIntervals \
+    --java-options '-Xmx7000m' \
+    -R {input[1]} \
+    -L {input[0]} \
+    -O results/intervals/gvcf/{sample} \
+    --scatter-count {config.intervals_scatter_count} \
+    --subdivision-mode BALANCING_WITHOUT_INTERVAL_SUBDIVISION \
+    --interval-merging-rule OVERLAPPING_ONLY \
+    &> {log}
+ls -1 results/intervals/gvcf/{sample}/*-scattered.interval_list > results/intervals/gvcf/{sample}/intervals.txt
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "gatk_haplotypecaller_interval"
+description = "Per-interval HaplotypeCaller to gVCF (interval mode, no-markdup BAM)"
+input = [
+    "results/bams/merged/{sample}.bam",
+    "results/bams/merged/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+    "results/intervals/gvcf/{sample}/{interval}-scattered.interval_list",
+]
+when = "config.intervals_enabled && config.variant_tool == 'gatk' && !config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+output = [
+    "results/interval_gvcfs/{sample}/{interval}.g.vcf.gz",
+    "results/interval_gvcfs/{sample}/{interval}.g.vcf.gz.tbi",
+]
+log = "logs/gatk_haplotypecaller_interval/{sample}/{interval}.txt"
+shell = """
+gatk HaplotypeCaller \
+    --java-options '-Xmx7000m' \
+    -R {input[2]} \
+    -I {input[0]} \
+    --read-index {input[1]} \
+    -L {input[5]} \
+    -O {output[0]} \
+    -ploidy {config.ploidy} \
+    --native-pair-hmm-threads {threads} \
+    --emit-ref-confidence GVCF \
+    --min-pruning 1 \
+    --min-dangling-branch-length 1
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "gatk_haplotypecaller_interval_markdup"
+description = "Per-interval HaplotypeCaller to gVCF (interval mode, duplicate-marked BAM)"
+input = [
+    "results/bams/markdup/{sample}.bam",
+    "results/bams/markdup/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+    "results/intervals/gvcf/{sample}/{interval}-scattered.interval_list",
+]
+when = "config.intervals_enabled && config.variant_tool == 'gatk' && config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+output = [
+    "results/interval_gvcfs/{sample}/{interval}.g.vcf.gz",
+    "results/interval_gvcfs/{sample}/{interval}.g.vcf.gz.tbi",
+]
+log = "logs/gatk_haplotypecaller_interval_markdup/{sample}/{interval}.txt"
+shell = """
+gatk HaplotypeCaller \
+    --java-options '-Xmx7000m' \
+    -R {input[2]} \
+    -I {input[0]} \
+    --read-index {input[1]} \
+    -L {input[5]} \
+    -O {output[0]} \
+    -ploidy {config.ploidy} \
+    --native-pair-hmm-threads {threads} \
+    --emit-ref-confidence GVCF \
+    --min-pruning 1 \
+    --min-dangling-branch-length 1
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "gatk_haplotypecaller_interval_external"
+description = "Per-interval HaplotypeCaller to gVCF (interval mode, staged external BAM)"
+input = [
+    "results/bams/input/{sample}.bam",
+    "results/bams/input/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+    "results/intervals/gvcf/{sample}/{interval}-scattered.interval_list",
+]
+when = "config.intervals_enabled && config.variant_tool == 'gatk' && wildcard.input_type == 'bam'"
+output = [
+    "results/interval_gvcfs/{sample}/{interval}.g.vcf.gz",
+    "results/interval_gvcfs/{sample}/{interval}.g.vcf.gz.tbi",
+]
+log = "logs/gatk_haplotypecaller_interval_external/{sample}/{interval}.txt"
+shell = """
+gatk HaplotypeCaller \
+    --java-options '-Xmx7000m' \
+    -R {input[2]} \
+    -I {input[0]} \
+    --read-index {input[1]} \
+    -L {input[5]} \
+    -O {output[0]} \
+    -ploidy {config.ploidy} \
+    --native-pair-hmm-threads {threads} \
+    --emit-ref-confidence GVCF \
+    --min-pruning 1 \
+    --min-dangling-branch-length 1
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "concat_interval_gvcfs"
+description = "Merge per-interval gVCFs into the per-sample gVCF (interval mode)"
+input = ["results/interval_gvcfs/{sample}/*.g.vcf.gz"]
+when = "config.intervals_enabled && config.variant_tool == 'gatk' && wildcard.input_type != 'gvcf'"
+output = [
+    "results/gvcfs/{sample}.g.vcf.gz",
+    "results/gvcfs/{sample}.g.vcf.gz.tbi",
+]
+depends_on = ["create_gvcf_intervals"]
+log = "logs/concat_interval_gvcfs/{sample}.txt"
+shell = """
+bcftools concat -D -a -Ou {input} 2> {log} \
+    | bcftools sort -T . -Oz -o {output[0]} 2>> {log}
+bcftools index -t {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/bcftools.yaml"
+
+[[rules]]
+name = "create_db_intervals"
+description = "Split the filtered interval list into DB scatter shards (joint genotyping, interval mode, output_pattern producer)"
+input = [
+    "results/intervals/filtered.interval_list",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.intervals_enabled && config.joint_genotyping_enabled && config.variant_tool == 'gatk'"
+output_pattern = "results/intervals/db/{db_interval}-scattered.interval_list"
+log = "logs/create_db_intervals.txt"
+shell = """
+: > {log}
+mkdir -p results/intervals/db
+raw_dir=$(mktemp -d results/intervals/db/gatk_split_raw.XXXXXX)
+trap 'rm -rf "$raw_dir"' EXIT
+NUM_SAMPLES=$(echo "{config.samples_list}" | tr ',' '\n' | grep -c . || true)
+DB_SCATTER=$(awk -v n="$NUM_SAMPLES" -v f="{config.intervals_db_scatter_factor}" -v g="{config.intervals_scatter_count}" 'BEGIN { c = int(f * n * g); print (c < 1 ? 1 : c) }')
+gatk SplitIntervals \
+    --java-options '-Xmx7000m' \
+    -R {input[1]} \
+    -L {input[0]} \
+    -O "$raw_dir" \
+    --scatter-count "$DB_SCATTER" \
+    --subdivision-mode INTERVAL_SUBDIVISION \
+    --interval-merging-rule OVERLAPPING_ONLY \
+    >> {log} 2>&1
+python scripts/interval_list_tools.py split-db \
+    --input-dir "$raw_dir" \
+    --output-dir results/intervals/db \
+    --fof results/intervals/db/intervals.txt \
+    --max-intervals-per-shard {config.intervals_db_max_intervals_per_shard} \
+    --max-contigs-per-shard {config.intervals_db_max_contigs_per_shard} \
+    --merge-contigs-threshold 50 \
+    >> {log} 2>&1
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "gatk_genomics_db_import_interval"
+description = "Import all sample gVCFs into one per-shard GenomicsDB workspace (interval mode)"
+input = [
+    "results/genomics_db/mapfile.txt",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+    "results/intervals/db/{db_interval}-scattered.interval_list",
+]
+expand_inputs = [
+    { pattern = "results/gvcfs/{sample}.g.vcf.gz", variables = { sample = "config.samples_list" } },
+    { pattern = "results/gvcfs/{sample}.g.vcf.gz.tbi", variables = { sample = "config.samples_list" } },
+]
+when = "config.intervals_enabled && config.joint_genotyping_enabled && config.variant_tool == 'gatk'"
+output = [
+    "results/gatk_genomics_db/L{db_interval}.tar",
+]
+temp_output = ["results/gatk_genomics_db/L{db_interval}.tar"]
+log = "logs/gatk_genomics_db_import_interval/{db_interval}.txt"
+shell = """
+: > {log}
+export TILEDB_DISABLE_FILE_LOCKING=1
+DB_DIR="results/gatk_genomics_db/L{db_interval}"
+rm -rf "$DB_DIR"
+trap 'rm -rf "$DB_DIR"' EXIT
+MERGE_CONTIGS_ARG=$(python scripts/interval_list_tools.py genomicsdb-merge-contigs-arg \\
+    --input {input[4]} \\
+    --threshold 50 2>> {log})
+gatk GenomicsDBImport \
+    --java-options '-Xmx7000m' \
+    --genomicsdb-shared-posixfs-optimizations true \
+    --batch-size 25 \
+    --genomicsdb-workspace-path "$DB_DIR" \
+    --merge-input-intervals $MERGE_CONTIGS_ARG \
+    --reader-threads {threads} \
+    -L {input[4]} \
+    --sample-name-map {input[0]} \
+    >> {log} 2>&1
+tar -cf {output[0]} "$DB_DIR" >> {log} 2>&1
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "gatk_genotype_gvcfs_interval"
+description = "Jointly genotype one DB shard (interval mode)"
+input = [
+    "results/gatk_genomics_db/L{db_interval}.tar",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.intervals_enabled && config.joint_genotyping_enabled && config.variant_tool == 'gatk'"
+output = [
+    "results/vcfs/intervals/L{db_interval}.vcf.gz",
+    "results/vcfs/intervals/L{db_interval}.vcf.gz.tbi",
+]
+log = "logs/gatk_genotype_gvcfs_interval/{db_interval}.txt"
+shell = """
+EXTRACT_DIR=$(mktemp -d .oxo-joint-gvcf.XXXXXX)
+trap 'rm -rf "$EXTRACT_DIR"' EXIT
+tar -xf {input[0]} -C "$EXTRACT_DIR"
+gatk GenotypeGVCFs \
+    --java-options '-Xmx7000m' \
+    -R {input[1]} \
+    --heterozygosity {config.gatk_het_prior} \
+    --genomicsdb-shared-posixfs-optimizations true \
+    -V gendb://"$EXTRACT_DIR/results/gatk_genomics_db/L{db_interval}" \
+    -O {output[0]} \
+    &> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "concat_interval_vcfs"
+description = "Concatenate per-shard raw VCFs into the joint raw VCF (interval mode)"
+input = ["results/vcfs/intervals/*.vcf.gz"]
+when = "config.intervals_enabled && config.joint_genotyping_enabled && config.variant_tool == 'gatk'"
+output = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.tbi",
+]
+temp_output = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.tbi",
+]
+depends_on = ["create_db_intervals"]
+log = "logs/concat_interval_vcfs.txt"
+shell = """
+bcftools concat -D -a -Ou {input} 2> {log} \
+    | bcftools sort -T . -Oz -o {output[0]} 2>> {log}
+bcftools index -t {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/bcftools.yaml"
+
+# ---------------------------------------------------------------------------
 # Variant calling (per-sample gVCF)
 # ---------------------------------------------------------------------------
 
@@ -436,7 +844,7 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
-when = "config.variant_tool == 'gatk' && !config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "config.variant_tool == 'gatk' && !config.mark_duplicates && !config.intervals_enabled && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = [
     "results/gvcfs/{sample}.g.vcf.gz",
     "results/gvcfs/{sample}.g.vcf.gz.tbi",
@@ -473,7 +881,7 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
-when = "config.variant_tool == 'gatk' && config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "config.variant_tool == 'gatk' && config.mark_duplicates && !config.intervals_enabled && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = [
     "results/gvcfs/{sample}.g.vcf.gz",
     "results/gvcfs/{sample}.g.vcf.gz.tbi",
@@ -510,7 +918,7 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
-when = "config.variant_tool == 'gatk' && wildcard.input_type == 'bam'"
+when = "config.variant_tool == 'gatk' && !config.intervals_enabled && wildcard.input_type == 'bam'"
 output = [
     "results/gvcfs/{sample}.g.vcf.gz",
     "results/gvcfs/{sample}.g.vcf.gz.tbi",
@@ -693,7 +1101,7 @@ expand_inputs = [
     { pattern = "results/gvcfs/{sample}.g.vcf.gz", variables = { sample = "config.samples_list" } },
     { pattern = "results/gvcfs/{sample}.g.vcf.gz.tbi", variables = { sample = "config.samples_list" } },
 ]
-when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk'"
+when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk' && !config.intervals_enabled"
 output = [
     "results/gatk_genomics_db",
     "results/gatk_genomics_db.tar",
@@ -719,7 +1127,7 @@ gatk GenomicsDBImport \
     --reader-threads {threads} \
     -L results/reference/contigs.list \
     --sample-name-map {input[0]} \
-    &>> {log}
+    >> {log} 2>&1
 tar -cf {output[1]} {output[0]} >> {log} 2>&1
 """
 tags = ["variant-calling"]
@@ -739,7 +1147,7 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
-when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk'"
+when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk' && !config.intervals_enabled"
 output = [
     "results/vcfs/raw.vcf.gz",
     "results/vcfs/raw.vcf.gz.tbi",
@@ -810,6 +1218,139 @@ threads = 1
 
 [rules.environment]
 conda = "envs/glnexus.yaml"
+
+# ---------------------------------------------------------------------------
+# bcftools caller (gated by variant_tool='bcftools')
+#
+# Port of upstream's checkpoint-based region fan-out (workflow/rules/
+# variant_calling/bcftools.smk:13): the bcftools_regions checkpoint reads
+# the runtime .fai and enumerates one region per reference contig; the
+# engine cannot know the contig list until index_reference has run, so
+# bcftools_regions is an output_pattern producer (one marker file per
+# contig) and bcftools_call is a deferred consumer instantiated once per
+# discovered region. The cohort BAM list is resolved per sample in the
+# shell (markdup -> merged -> external priority, mirroring upstream's
+# get_final_bam); the declared BAM-dir globs order the calls behind every
+# BAM-producing branch via DAG edges.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+name = "bcftools_regions"
+description = "Enumerate reference contigs into per-region markers (bcftools caller, output_pattern producer)"
+input = ["results/reference/{config.reference_name}.fa.gz.fai"]
+when = "config.variant_tool == 'bcftools'"
+output_pattern = "results/vcfs/regions/{region}.txt"
+log = "logs/bcftools_regions.txt"
+shell = """
+: > {log}
+mkdir -p results/vcfs/regions
+idx=0
+while IFS= read -r line; do
+    contig=$(printf '%s' "$line" | cut -f1)
+    [ -z "$contig" ] && continue
+    region=$(printf 'L%06d' "$idx")
+    printf '%s\n' "$contig" > "results/vcfs/regions/$region.txt"
+    printf '%s\t%s\n' "$region" "$contig"
+    idx=$((idx + 1))
+done < {input[0]} > results/vcfs/regions/regions.tsv
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/bcftools.yaml"
+
+[[rules]]
+name = "bcftools_call"
+description = "Per-region cohort mpileup + call (bcftools caller)"
+input = [
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/vcfs/regions/{region}.txt",
+    "results/bams/merged/*.bam",
+    "results/bams/markdup/*.bam",
+    "results/bams/input/*.bam",
+]
+when = "config.variant_tool == 'bcftools'"
+output = [
+    "results/vcfs/regions/{region}.vcf.gz",
+    "results/vcfs/regions/{region}.vcf.gz.tbi",
+]
+temp_output = [
+    "results/vcfs/regions/{region}.vcf.gz",
+    "results/vcfs/regions/{region}.vcf.gz.tbi",
+]
+log = "logs/bcftools_call/{region}.txt"
+shell = """
+: > {log}
+CONTIG=$(cat {input[1]})
+BAMS=()
+for s in $(echo "{config.samples_list}" | tr ',' ' '); do
+    if [ -f "results/bams/markdup/$s.bam" ]; then
+        BAMS+=("results/bams/markdup/$s.bam")
+    elif [ -f "results/bams/merged/$s.bam" ]; then
+        BAMS+=("results/bams/merged/$s.bam")
+    elif [ -f "results/bams/input/$s.bam" ]; then
+        BAMS+=("results/bams/input/$s.bam")
+    fi
+done
+if [ ${#BAMS[@]} -eq 0 ]; then
+    echo "no final BAM found for any sample — skipping bcftools_call for region {region}" >> {log}
+    exit 0
+fi
+bcftools mpileup \
+    -f results/reference/{config.reference_name}.fa.gz \
+    -q {config.bcftools_min_mapq} \
+    -Q {config.bcftools_min_baseq} \
+    -d {config.bcftools_max_depth} \
+    -r "$CONTIG" \
+    --threads {threads} \
+    -Ou "${BAMS[@]}" 2> {log} \
+    | bcftools call \
+        -m \
+        --ploidy {config.ploidy} \
+        --threads {threads} \
+        -v \
+        -Oz \
+        -o {output[0]} - 2>> {log}
+bcftools index -t {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/bcftools.yaml"
+
+[[rules]]
+name = "bcftools_concat_regions"
+description = "Concatenate per-region VCFs into the cohort raw VCF (bcftools caller)"
+input = ["results/vcfs/regions/*.vcf.gz"]
+when = "config.variant_tool == 'bcftools'"
+output = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.tbi",
+]
+temp_output = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.tbi",
+]
+depends_on = ["bcftools_regions"]
+log = "logs/bcftools_concat_regions.txt"
+shell = """
+bcftools concat -D -a -Ou {input} 2> {log} \
+    | bcftools sort -T . -Oz -o {output[0]} 2>> {log}
+bcftools index -t {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/bcftools.yaml"
 
 # ---------------------------------------------------------------------------
 # GATK hard variant filtration (downstream of joint genotyping)
@@ -1558,7 +2099,7 @@ plink --vcf {input[0]} --out results/qc/plink \\
     --vcf-half-call missing \\
     --mind {config.qc_max_sample_missingness} \\
     --allow-extra-chr --autosome-num 95 --distance square \\
-    --const-fid &>> {log}
+    --const-fid >> {log} 2>&1
 """
 tags = ["qc-module"]
 
@@ -1600,11 +2141,11 @@ log = "logs/qc/admixture.txt"
 shell = """
 cp {input[3]} {input[1]} 2> {log}
 
-admixture {input[0]} 2 &>> {log}
-admixture {input[0]} 3 &>> {log}
+admixture {input[0]} 2 >> {log} 2>&1
+admixture {input[0]} 3 >> {log} 2>&1
 
-mv plink.2.* results/qc &>> {log}
-mv plink.3.* results/qc &>> {log}
+mv plink.2.* results/qc >> {log} 2>&1
+mv plink.3.* results/qc >> {log} 2>&1
 """
 tags = ["qc-module"]
 
