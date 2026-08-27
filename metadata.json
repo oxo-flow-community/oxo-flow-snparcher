@@ -84,24 +84,38 @@
     "qc_setup_admixture",
     "qc_admixture",
     "generate_coords_file",
-    "qc_dashboard"
+    "qc_dashboard",
+    "picard_intervals",
+    "filter_picard_intervals",
+    "create_gvcf_intervals",
+    "gatk_haplotypecaller_interval",
+    "gatk_haplotypecaller_interval_markdup",
+    "gatk_haplotypecaller_interval_external",
+    "concat_interval_gvcfs",
+    "create_db_intervals",
+    "gatk_genomics_db_import_interval",
+    "gatk_genotype_gvcfs_interval",
+    "concat_interval_vcfs",
+    "bcftools_regions",
+    "bcftools_call",
+    "bcftools_concat_regions"
   ],
   "excluded": [
-    "interval scatter (picard_intervals, create_gvcf_intervals/create_db_intervals checkpoints at workflow/rules/intervals.smk:59,89, gatk_haplotypecaller_interval, concat_interval_*) — snakemake checkpoints enumerate the per-interval interval_list files at runtime from one SplitIntervals call; oxo-flow’s static DAG cannot fan out over runtime-discovered files",
-    "bcftools_call — the bcftools_regions checkpoint (workflow/rules/variant_calling/bcftools.smk:13) enumerates the reference contigs from the runtime .fai; bcftools_call fans out one mpileup+call per region, a runtime-discovered fan-out the static DAG cannot plan",
     "parabricks — every rule runs with --nv GPU passthrough (workflow/rules/parabricks.smk); the oxo-flow docker backend has no --nv support, plus NVIDIA EULA/license cannot be enforced",
     "sentieon — proprietary SENTIEON_LICENSE server gating (config/config.yaml sentieon section); cannot be distributed or verified",
     "denovo — no such step in upstream v2.2",
     "structural_variants — no such step in upstream v2.2",
     "multi-library/multi-unit sample-sheet rows — the sample-group model is one unit per sample; per-library fan-out (library_id/input_unit) has no model dimension and consumers are hard-coded to the u1 unit",
-    "per-sample mark_duplicates override — upstream reads the value per sample-sheet row (default true); the port maps it to the global mark_duplicates config key (default false)"
+    "per-sample mark_duplicates override — upstream reads the value per sample-sheet row (default true); the port maps it to the global mark_duplicates config key (default false)",
+    "interval-mode compress_interval_raw_vcf and long-contig (CSI) paths — the port's concat_interval_vcfs consumes GATK -Oz outputs directly and always uses TBI (short-contig) indexing"
   ],
-  "rule_count": 60,
+  "rule_count": 74,
   "tools": [
     "fastp",
     "bwa",
     "samtools",
     "gatk4",
+    "picard",
     "sambamba",
     "sra-tools",
     "deepvariant",
@@ -117,9 +131,9 @@
     "r",
     "python"
   ],
-  "description": "Variant calling for non-model organisms: paired FASTQ reads (or SRA accessions, or external BAMs) are trimmed and filtered with fastp, aligned with BWA-MEM, optionally duplicate-marked with sambamba, and called to per-sample gVCFs with GATK HaplotypeCaller or DeepVariant (low-coverage defaults: -ploidy 2, --min-pruning 1). Optional upstream branches are gated by config keys: joint genotyping (GenomicsDBImport + GenotypeGVCFs, or GLnexus for DeepVariant), GATK hard variant filtration, callable-sites BED (mosdepth/clam coverage + genmap mappability), the postprocess module (clean SNP/indel call sets), the qc module (PLINK PCA/relatedness, ADMIXTURE, interactive dashboard), and a cohort QC metrics report.",
+  "description": "Variant calling for non-model organisms: paired FASTQ reads (or SRA accessions, or external BAMs) are trimmed and filtered with fastp, aligned with BWA-MEM, optionally duplicate-marked with sambamba, and called to per-sample gVCFs with GATK HaplotypeCaller or DeepVariant (low-coverage defaults: -ploidy 2, --min-pruning 1). Optional upstream branches are gated by config keys: joint genotyping (GenomicsDBImport + GenotypeGVCFs, or GLnexus for DeepVariant), GATK hard variant filtration, callable-sites BED (mosdepth/clam coverage + genmap mappability), the postprocess module (clean SNP/indel call sets), the qc module (PLINK PCA/relatedness, ADMIXTURE, interactive dashboard), and a cohort QC metrics report. Two runtime-fan-out branches are ported with the engine's output_pattern primitive (oxo-flow >= 0.17): interval scatter (per-interval gVCF calling and per-shard joint genotyping) and the per-region bcftools caller; both default off.",
   "installation": {
-    "engine": "oxo-flow >= 0.12.0",
+    "engine": "oxo-flow >= 0.12.0 (interval-scatter and bcftools branches need output_pattern: >= 0.17)",
     "toolchain": "conda envs — pinned versions (fastp 1.3.6, bwa 0.7.19, samtools 1.24, gatk4 4.6.2.0, sambamba 1.0.1, sra-tools 3.2.1, mosdepth 0.3.3, vcftools 0.1.16, bcftools 1.23, plink2; conda-forge + bioconda); deepvariant branch needs a docker backend",
     "requirements": [
       "reference genome FASTA (plain or gzip), passed as reference_source at run time — bgzip-compressed and indexed by the workflow itself (no pre-built indices)",
