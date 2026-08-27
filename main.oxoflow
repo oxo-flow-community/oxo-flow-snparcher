@@ -17,14 +17,15 @@
 #   modules_postprocess_enabled=true  postprocess module (needs callable BED)
 #   modules_qc_enabled=true     qc module (plink/admixture/dashboard)
 #   input_type per sample group: 'fastq' (default), 'srr' (SRA download +
-#   fastp), or 'bam' (stage external BAM) — set in [[sample_groups]] metadata
+#   fastp), 'bam' (stage external BAM), or 'gvcf' (external gVCF, normalized
+#   straight into joint genotyping) — set in [[sample_groups]] metadata
 #
 # Structural exclusions (impossible in the oxo-flow static DAG — see README):
 #   interval scatter (snakemake checkpoints create_gvcf_intervals /
-#   create_db_intervals extend the DAG at runtime), bcftools caller
-#   (bcftools_regions checkpoint), parabricks (GPU --nv passthrough +
-#   NVIDIA license), sentieon (proprietary license), gvcf input type
-#   (external per-sample paths cannot feed group expansion)
+#   create_db_intervals enumerate the per-interval files at runtime),
+#   bcftools caller (bcftools_regions checkpoint enumerates reference
+#   contigs at runtime), parabricks (GPU --nv passthrough + NVIDIA
+#   license), sentieon (proprietary license)
 
 [workflow]
 name = "snparcher"
@@ -63,6 +64,7 @@ qc_exclude_scaffolds = ""
 qc_clusters = 3
 qc_pca_dims = 10
 qc_google_api_key = ""
+sample_metadata = ""
 
 [defaults]
 memory = "8G"
@@ -84,6 +86,14 @@ memory = "8G"
 #   name = "external"
 #   samples = ["my_bam_sample"]
 #   metadata = { input_type = "bam", bam_path = "/path/to/sample.bam" }
+#
+#   # External gVCF inputs (normalize_external_gvcf_for_gatk -> joint
+#   # genotyping; requires joint_genotyping_enabled = true):
+#   # gvcf_path is required metadata
+#   [[sample_groups]]
+#   name = "external_gvcfs"
+#   samples = ["my_gvcf_sample"]
+#   metadata = { input_type = "gvcf", gvcf_path = "/path/to/sample.g.vcf.gz" }
 #
 # Upstream's sample sheet columns (sample_id, input_type, input, library_id,
 # mark_duplicates) map to: sample id = [[sample_groups]] entry, input_type =
@@ -392,6 +402,25 @@ tags = ["alignment"]
 
 [rules.environment]
 conda = "envs/samtools.yaml"
+
+[[rules]]
+name = "normalize_external_gvcf_for_gatk"
+description = "Normalize an external gVCF input (recompress + tabix index) for joint genotyping"
+input = ["{gvcf_path}"]
+when = "wildcard.input_type == 'gvcf'"
+output = [
+    "results/gvcfs/{sample}.g.vcf.gz",
+    "results/gvcfs/{sample}.g.vcf.gz.tbi",
+]
+log = "logs/normalize_external_gvcf_for_gatk/{sample}.txt"
+shell = """
+bcftools view -Oz -o {output[0]} {input[0]} 2> {log}
+bcftools index -t {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.environment]
+conda = "envs/bcftools.yaml"
 
 # ---------------------------------------------------------------------------
 # Variant calling (per-sample gVCF)
@@ -1579,9 +1608,20 @@ tags = ["qc-module"]
 conda = "envs/qc_admixture.yaml"
 
 [[rules]]
+name = "generate_coords_file"
+description = "Generate the QC coordinates file from optional sample metadata (lat/long)"
+input = []
+when = "config.modules_qc_enabled"
+output = ["results/qc/coords.txt"]
+log = "logs/qc/generate_coords_file.txt"
+script = "scripts/generate_coords.py {config.sample_metadata} {output[0]}"
+tags = ["qc-module"]
+
+[[rules]]
 name = "qc_dashboard"
 description = "Render the interactive QC dashboard"
 input = [
+    "results/qc/coords.txt",
     "results/qc/plink.eigenvec",
     "results/qc/plink.eigenval",
     "results/qc/individuals.idepth",
