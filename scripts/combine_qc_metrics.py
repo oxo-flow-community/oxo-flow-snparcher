@@ -27,6 +27,10 @@ def main(argv):
     bam_stats = {}
 
     for fn in input_files:
+        # gvcf cohorts produce neither fastp nor bam metrics — aggregate
+        # whatever exists (upstream's qc module iterates existing files).
+        if not os.path.exists(fn):
+            continue
         sample = os.path.basename(fn).replace(".json", "")
         with open(fn) as f:
             data = json.load(f)
