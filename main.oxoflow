@@ -848,7 +848,7 @@ output = [
     "results/gvcfs/work/{sample}.g.vcf",
     "results/gvcfs/work/{sample}.g.vcf.idx",
 ]
-when = "config.intervals_enabled && config.variant_tool == 'gatk' && wildcard.input_type != 'gvcf' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+when = "config.intervals_enabled && config.variant_tool == 'gatk' && {meta.input_type} != 'gvcf' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
 depends_on = ["create_gvcf_intervals", "resolve_long_contig_mode"]
 log = "logs/concat_interval_gvcfs_long/{sample}.txt"
 shell = """
