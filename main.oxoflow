@@ -7,7 +7,9 @@
 #
 # Ported branches, gated by config keys (all default OFF so the default plan
 # is unchanged; flip a key to activate a branch — see README fidelity table):
-#   mark_duplicates=true        sambamba markdup + merge (upstream default true)
+#   mark_duplicates=true        sambamba markdup + merge (upstream default true);
+#                                 per-sample override via the optional [workflow]
+#                                 metadata_file mark_duplicates column (see README)
 #   variant_tool='deepvariant'  DeepVariant per-sample gVCF calling (docker)
 #   variant_tool='bcftools'     bcftools mpileup+call caller (runtime-region
 #                               fan-out via output_pattern, engine >= 0.17)
@@ -36,6 +38,11 @@ name = "snparcher"
 version = "2.2.0"
 description = "Variant calling for non-model organisms — fastp, BWA-MEM, GATK HaplotypeCaller. oxo-flow port of harvardinformatics/snparcher v2.2."
 author = "oxo-flow-community"
+# Optional per-sample metadata table (TSV/CSV/JSON keyed by sample id, see
+# README "Per-sample mark_duplicates override"): a `mark_duplicates` column
+# (values true/false) overrides config.mark_duplicates for that sample.
+# Unset by default — every sample then follows the global config key.
+# metadata_file = "metadata/samples.tsv"
 
 [config]
 reference_name = "my_organism"
@@ -111,8 +118,9 @@ memory = "8G"
 # Upstream's sample sheet columns (sample_id, input_type, input, library_id,
 # mark_duplicates) map to: sample id = [[sample_groups]] entry, input_type =
 # metadata.input_type, input = metadata (accession / bam_path / raw FASTQs),
-# library_id = sample id, mark_duplicates = global config. Per-sample
-# mark_duplicates overrides are not ported.
+# library_id = sample id, mark_duplicates = global config, overridable per
+# sample via the optional [workflow] metadata_file `mark_duplicates` column
+# (see README "Per-sample mark_duplicates override").
 
 [[sample_groups]]
 name = "cohort"
@@ -325,7 +333,7 @@ conda = "envs/samtools.yaml"
 name = "merge_library_level_bams"
 description = "Merge per-library BAMs into the final sample BAM (no duplicate marking)"
 input = ["results/bams/library/{sample}/{sample}.bam"]
-when = "!config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "(!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = ["results/bams/merged/{sample}.bam"]
 log = "logs/merge_library_level_bams/{sample}.txt"
 shell = "samtools merge -f {output[0]} {input[0]}"
@@ -338,7 +346,7 @@ conda = "envs/samtools.yaml"
 name = "markdup_library"
 description = "Mark duplicate reads per library with sambamba (upstream default branch)"
 input = ["results/bams/library/{sample}/{sample}.bam"]
-when = "config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "(config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = ["results/bams/library_markdup/{sample}/{sample}.bam"]
 temp_output = ["results/bams/library_markdup/{sample}/{sample}.bam"]
 log = "logs/markdup/{sample}.txt"
@@ -358,7 +366,7 @@ conda = "envs/sambamba.yaml"
 name = "merge_dedup_libraries"
 description = "Merge duplicate-marked library BAMs into the final sample BAM"
 input = ["results/bams/library_markdup/{sample}/{sample}.bam"]
-when = "config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "(config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = ["results/bams/markdup/{sample}.bam"]
 log = "logs/merge_dedup_libraries/{sample}.txt"
 shell = "samtools merge -f {output[0]} {input[0]}"
@@ -381,7 +389,7 @@ tags = ["alignment"]
 name = "index_bam_csi"
 description = "Index the final BAM with CSI (required by GATK)"
 input = ["results/bams/merged/{sample}.bam"]
-when = "!config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "(!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = ["results/bams/merged/{sample}.bam.csi"]
 log = "logs/index_bam_csi/{sample}.txt"
 shell = "samtools index -c {input[0]} {output[0]}"
@@ -394,7 +402,7 @@ conda = "envs/samtools.yaml"
 name = "index_bam_csi_markdup"
 description = "Index the duplicate-marked final BAM with CSI"
 input = ["results/bams/markdup/{sample}.bam"]
-when = "config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "(config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = ["results/bams/markdup/{sample}.bam.csi"]
 log = "logs/index_bam_csi_markdup/{sample}.txt"
 shell = "samtools index -c {input[0]} {output[0]}"
@@ -542,7 +550,7 @@ input = [
     "results/reference/{config.reference_name}.dict",
     "results/intervals/gvcf/{sample}/{interval}-scattered.interval_list",
 ]
-when = "config.intervals_enabled && config.variant_tool == 'gatk' && !config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "config.intervals_enabled && config.variant_tool == 'gatk' && (!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = [
     "results/interval_gvcfs/{sample}/{interval}.g.vcf.gz",
     "results/interval_gvcfs/{sample}/{interval}.g.vcf.gz.tbi",
@@ -581,7 +589,7 @@ input = [
     "results/reference/{config.reference_name}.dict",
     "results/intervals/gvcf/{sample}/{interval}-scattered.interval_list",
 ]
-when = "config.intervals_enabled && config.variant_tool == 'gatk' && config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "config.intervals_enabled && config.variant_tool == 'gatk' && (config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = [
     "results/interval_gvcfs/{sample}/{interval}.g.vcf.gz",
     "results/interval_gvcfs/{sample}/{interval}.g.vcf.gz.tbi",
@@ -844,7 +852,7 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
-when = "config.variant_tool == 'gatk' && !config.mark_duplicates && !config.intervals_enabled && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "config.variant_tool == 'gatk' && (!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && !config.intervals_enabled && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = [
     "results/gvcfs/{sample}.g.vcf.gz",
     "results/gvcfs/{sample}.g.vcf.gz.tbi",
@@ -881,7 +889,7 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
-when = "config.variant_tool == 'gatk' && config.mark_duplicates && !config.intervals_enabled && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "config.variant_tool == 'gatk' && (config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && !config.intervals_enabled && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = [
     "results/gvcfs/{sample}.g.vcf.gz",
     "results/gvcfs/{sample}.g.vcf.gz.tbi",
@@ -955,7 +963,7 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
-when = "config.variant_tool == 'deepvariant' && !config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "config.variant_tool == 'deepvariant' && (!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = [
     "results/gvcfs/{sample}.g.vcf.gz",
     "results/gvcfs/{sample}.g.vcf.gz.tbi",
@@ -997,7 +1005,7 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
-when = "config.variant_tool == 'deepvariant' && config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "config.variant_tool == 'deepvariant' && (config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = [
     "results/gvcfs/{sample}.g.vcf.gz",
     "results/gvcfs/{sample}.g.vcf.gz.tbi",
@@ -1416,7 +1424,7 @@ tags = ["qc"]
 name = "bam_stats"
 description = "Compute samtools coverage and flagstat metrics (no-markdup BAM)"
 input = ["results/bams/merged/{sample}.bam"]
-when = "!config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "(!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = [
     "results/qc_metrics/bam/{sample}_coverage.txt",
     "results/qc_metrics/bam/{sample}_flagstat.txt",
@@ -1439,7 +1447,7 @@ conda = "envs/samtools.yaml"
 name = "bam_stats_markdup"
 description = "Compute samtools coverage and flagstat metrics (duplicate-marked BAM)"
 input = ["results/bams/markdup/{sample}.bam"]
-when = "config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "(config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = [
     "results/qc_metrics/bam/{sample}_coverage.txt",
     "results/qc_metrics/bam/{sample}_flagstat.txt",
@@ -1521,7 +1529,7 @@ input = [
     "results/bams/merged/{sample}.bam",
     "results/bams/merged/{sample}.bam.csi",
 ]
-when = "config.callable_sites_enabled && !config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "config.callable_sites_enabled && (!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = [
     "results/callable_sites/depths/{sample}.per-base.d4",
     "results/callable_sites/depths/{sample}.mosdepth.summary.txt",
@@ -1546,7 +1554,7 @@ input = [
     "results/bams/markdup/{sample}.bam",
     "results/bams/markdup/{sample}.bam.csi",
 ]
-when = "config.callable_sites_enabled && config.mark_duplicates && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "config.callable_sites_enabled && (config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = [
     "results/callable_sites/depths/{sample}.per-base.d4",
     "results/callable_sites/depths/{sample}.mosdepth.summary.txt",

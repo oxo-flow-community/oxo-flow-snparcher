@@ -97,8 +97,47 @@ Example SRA, external-BAM and external-gVCF groups are documented in the
 header of `main.oxoflow`. Each gvcf sample needs its own group (the
 `gvcf_path` metadata is per group, like `bam_path`). The per-sample
 `mark_duplicates` column is mapped to the global `mark_duplicates` config
-key (upstream applies it per sample); a single group-level override is not
-ported.
+key (upstream applies it per sample), with an optional per-sample override
+via the `[workflow]` `metadata_file` table — see [Per-sample
+`mark_duplicates` override](#per-sample-mark_duplicates-override).
+
+### Per-sample `mark_duplicates` override
+
+Upstream snpArcher reads `mark_duplicates` from each sample-sheet row
+(default `true`); the port maps it to the global `config.mark_duplicates`
+key (default `false`). To override the global key per sample, set
+`[workflow]` `metadata_file` to a sample-keyed TSV/CSV/JSON table with a
+`mark_duplicates` column:
+
+```text
+# metadata/samples.tsv
+sample	mark_duplicates
+sample1	true
+sample2	false
+```
+
+```toml
+[workflow]
+metadata_file = "metadata/samples.tsv"
+```
+
+Precedence: a sample whose row defines the column uses that row's value
+(`true` routes it through sambamba `markdup_library` →
+`merge_dedup_libraries`; `false` through the no-markdup merge path). A
+sample with no row — or a table without the column — falls back to the
+global `config.mark_duplicates` exactly as before, so workflows that never
+add the column behave byte-identically to earlier versions. Values must be
+lowercase `true`/`false`; any other value is treated as "no override" and
+falls back to the global key. The table is a lookup only: it does not
+define the sample set (`[[sample_groups]]` does), and `input_type` routing
+is unaffected. The `when` gates are the two-part form
+`(config.mark_duplicates || {meta.mark_duplicates} == 'true') &&
+{meta.mark_duplicates} != 'false'` (markdup) and
+`(!config.mark_duplicates || {meta.mark_duplicates} == 'false') &&
+{meta.mark_duplicates} != 'true'` (no-markdup) — each reduces exactly to
+today's `config.mark_duplicates` truthiness when the column is absent.
+This uses the engine's `metadata_file` + `{meta.*}` `when`-baking (engine
+PR #234, post-v0.16.0); the CI builds the engine from source accordingly.
 
 ### Branch toggles
 
@@ -109,7 +148,7 @@ runs the same 12 rules the port has always run (upstream defaults: both ON).
 
 | config key | default | activates |
 |---|---|---|
-| `mark_duplicates` | `false` | sambamba `markdup_library` → `merge_dedup_libraries` (upstream default `true`) |
+| `mark_duplicates` | `false` | sambamba `markdup_library` → `merge_dedup_libraries` (upstream default `true`); per-sample override via the optional `[workflow]` `metadata_file` `mark_duplicates` column |
 | `variant_tool` | `"gatk"` | `"deepvariant"` switches per-sample calling to `deepvariant_call*` (docker); `"bcftools"` switches joint calling to the per-region `bcftools_call*` (see Fidelity) |
 | `joint_genotyping_enabled` | `false` | GATK `create_db_mapfile` → `joint_genomics_db_import` → `joint_genotype_gvcfs`; for DeepVariant: `glnexus_joint` (upstream default `true`) |
 | `generate_filtered_vcf` | `false` | `variant_filtration` GATK hard filters (upstream default `true`) |
@@ -198,7 +237,7 @@ plan unchanged.
 | `bwa_mem` | `bwa_mem` | bwa 0.7.19, samtools 1.24 | identical command incl. read group `ID:{sample}.u1 SM:{sample} LB:{sample} PL:ILLUMINA`; raw BAM is temp like upstream |
 | `merge_library_bams` | `merge_library_bams` | samtools 1.24 | per-library merge, single input unit in the default path |
 | `merge_library_level_bams` | `merge_library_level_bams` | samtools 1.24 | no-markdup path (`results/bams/merged/{sample}.bam`) |
-| `markdup_library` / `merge_dedup_libraries` | `markdup_library` / `merge_dedup_libraries` | sambamba 1.0.1, samtools 1.24 | identical commands; gated on `mark_duplicates` (default `false`; upstream default `true` — see deviations below) |
+| `markdup_library` / `merge_dedup_libraries` | `markdup_library` / `merge_dedup_libraries` | sambamba 1.0.1, samtools 1.24 | identical commands; gated on `mark_duplicates` (default `false`; upstream default `true` — see deviations below; per-sample override via the `metadata_file` `mark_duplicates` column) |
 | `index_bam_csi` | `index_bam_csi` / `index_bam_csi_markdup` / `index_bam_csi_external` | samtools 1.24 | identical (`samtools index -c`), one per BAM-producing branch |
 | `stage_external_bam` | `stage_external_bam` | — | external BAM inputs symlinked into `results/bams/input/` then run through the standard callers |
 | `normalize_external_gvcf_for_gatk` / `archive_gatk_gvcf` (gvcf input type) | `normalize_external_gvcf_for_gatk` | bcftools 1.23 | external gVCF inputs recompressed + tabix-indexed to `results/gvcfs/{sample}.g.vcf.gz` (upstream long-contig mode's archive command) and fed straight into joint genotyping; gVCF samples skip calling. Upstream short mode feeds the raw external path to the mapfile; the port normalizes so the uniform `results/gvcfs/{sample}.g.vcf.gz` pattern holds. Upstream refuses gvcf inputs with non-GATK callers; the port accepts them in the GLnexus path (normalized gVCFs are valid GLnexus input) — see deviations |
@@ -244,7 +283,6 @@ plan unchanged.
 | parabricks (all `parabricks_*` rules) | requires `--nv` GPU passthrough (upstream `parabricks.smk` runs `--nv` images with `nvidia-docker`); the oxo-flow docker backend has no `--nv` support and no GPU device declaration; additionally NVIDIA EULA/license enforcement cannot be guaranteed in CI | `variant_calling/parabricks.smk` (every rule is `--nv`) |
 | sentieon (all `sentieon_*` rules) | proprietary tool gated on a `SENTIEON_LICENSE` server and a pre-installed license; cannot be distributed or verified in a community port | `config/config.yaml` `sentieon` section; `workflow/rules/sentieon.smk` |
 | `denovo` and `structural_variants` pipeline sections | do not exist as rules in upstream v2.2 | grep of `workflow/` at e0e7a94 finds neither rule set |
-| per-sample `mark_duplicates` override | upstream reads the value from the sample sheet per row (default `true`); the port maps it to the global `mark_duplicates` config key (default `false`), which every markdup/no-markdup branch gate reads. A per-group override would require restructuring all branch gates and still cannot match upstream's per-row semantics | `config/config.yaml` `mark_duplicates` vs `workflow/snakefiles` per-sample handling |
 | multi-library / multi-unit rows (library_id, input_unit) | the sample-group model has one unit per sample; consumers of `results/bams/raw/{sample}/{sample}/u1.bam` are hard-coded to the `u1` unit | sample sheet semantics in upstream `README` |
 
 ### Documented deviations from upstream
