@@ -943,6 +943,10 @@ conda = "envs/samtools.yaml"
 [[rules]]
 name = "parse_bam_stats"
 description = "Parse samtools coverage/flagstat output into a per-sample JSON"
+# gvcf cohorts have no BAM stage, so the coverage/flagstat producers never
+# run for them — the consumer must skip too (live-caught on bioinfo-wsx
+# 2026-08-27: FileNotFoundError for the gvcf sample's coverage.txt).
+when = "wildcard.input_type != 'gvcf'"
 input = [
     "results/qc_metrics/bam/{sample}_coverage.txt",
     "results/qc_metrics/bam/{sample}_flagstat.txt",
