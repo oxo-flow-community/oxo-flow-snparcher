@@ -91,12 +91,14 @@ libraries/units are not ported) and a metadata `input_type`:
 | `fastq` (default) | local read pairs | files in `raw/<sample>_{1,2}.fastq.gz` | `fastp` → alignment |
 | `srr` | SRA accession | group metadata `accession = "SRR..."` | `download_sra` (prefetch/fasterq-dump, ffq ENA fallback) → `fastp_srr` → alignment |
 | `bam` | external BAM path | group metadata `bam_path = "/path/to/sample.bam"` | `stage_external_bam` (symlink) → indexing/calling |
-| `gvcf` | external gVCF path | not ported | see Fidelity — external paths cannot feed group expansion in a static DAG |
+| `gvcf` | external gVCF path | group metadata `gvcf_path = "/path/to/sample.g.vcf.gz"` | `normalize_external_gvcf_for_gatk` (recompress + index) → joint genotyping; gVCF samples skip trimming/alignment/calling entirely, exactly like upstream |
 
-Example SRA and external-BAM groups are documented in the header of
-`main.oxoflow`. The per-sample `mark_duplicates` column is mapped to the
-global `mark_duplicates` config key (upstream applies it per sample); a
-single group-level override is not ported.
+Example SRA, external-BAM and external-gVCF groups are documented in the
+header of `main.oxoflow`. Each gvcf sample needs its own group (the
+`gvcf_path` metadata is per group, like `bam_path`). The per-sample
+`mark_duplicates` column is mapped to the global `mark_duplicates` config
+key (upstream applies it per sample); a single group-level override is not
+ported.
 
 ### Branch toggles
 
@@ -122,8 +124,11 @@ Parameter keys (`gatk_het_prior`, `deepvariant_model_type`,
 `callable_sites_kmer`, `callable_sites_min_score`, `postprocess_contig_size`,
 `postprocess_maf`, `postprocess_missingness`, `postprocess_exclude_scaffolds`,
 `qc_min_depth`, `qc_max_sample_missingness`, `qc_exclude_scaffolds`,
-`qc_clusters`, `qc_google_api_key`) mirror upstream's config values; pass
-overrides as `oxo-flow run main.oxoflow key=value`.
+`qc_clusters`, `qc_google_api_key`, `sample_metadata`) mirror upstream's
+config values; pass overrides as `oxo-flow run main.oxoflow key=value`.
+`sample_metadata` is upstream's optional qc-module metadata CSV
+(sample_id/long/lat columns) that feeds the dashboard's terrain-map panel —
+set it alongside `modules_qc_enabled=true` and `qc_google_api_key`.
 
 ## Source
 
@@ -134,7 +139,7 @@ license and attribution are recorded in [NOTICE.md](NOTICE.md).
 
 ## Fidelity
 
-58 rules ported from upstream v2.2 (up from 12), covering every branch that
+60 rules ported from upstream v2.2 (up from 12), covering every branch that
 can be expressed in oxo-flow's static DAG. Commands are ported verbatim
 (same flags, same output paths); upstream's snakemake `{{...}}` shell escaping
 is unwrapped to literal braces, and snakemake `{params.*}`/`{resources.*}`
@@ -152,6 +157,7 @@ references are resolved to their upstream values or to `{config.*}` keys.
 | `markdup_library` / `merge_dedup_libraries` | `markdup_library` / `merge_dedup_libraries` | sambamba 1.0.1, samtools 1.24 | identical commands; gated on `mark_duplicates` (default `false`; upstream default `true` — see deviations below) |
 | `index_bam_csi` | `index_bam_csi` / `index_bam_csi_markdup` / `index_bam_csi_external` | samtools 1.24 | identical (`samtools index -c`), one per BAM-producing branch |
 | `stage_external_bam` | `stage_external_bam` | — | external BAM inputs symlinked into `results/bams/input/` then run through the standard callers |
+| `normalize_external_gvcf_for_gatk` / `archive_gatk_gvcf` (gvcf input type) | `normalize_external_gvcf_for_gatk` | bcftools 1.23 | external gVCF inputs recompressed + tabix-indexed to `results/gvcfs/{sample}.g.vcf.gz` (upstream long-contig mode's archive command) and fed straight into joint genotyping; gVCF samples skip calling. Upstream short mode feeds the raw external path to the mapfile; the port normalizes so the uniform `results/gvcfs/{sample}.g.vcf.gz` pattern holds. Upstream refuses gvcf inputs with non-GATK callers; the port accepts them in the GLnexus path (normalized gVCFs are valid GLnexus input) — see deviations |
 | `gatk_haplotypecaller` (standard mode) | `gatk_haplotypecaller` / `_markdup` / `_external` | gatk4 4.6.2.0 | identical flags incl. `-ploidy 2 --emit-ref-confidence GVCF --min-pruning 1 --min-dangling-branch-length 1` (low-coverage defaults); `-Xmx7000m` = upstream default profile `mem_mb_reduced`; threads 1 as upstream |
 | `deepvariant_call` | `deepvariant_call` / `_markdup` / `_external` | google/deepvariant:1.10.0 (docker) | identical `/opt/deepvariant/bin/run_deepvariant` invocation; gated on `variant_tool = "deepvariant"` |
 | `create_db_mapfile` | `create_db_mapfile` | python (script) | identical logic, ported as `scripts/write_joint_gvcf_mapfile.py` |
@@ -173,21 +179,19 @@ references are resolved to their upstream values or to `{config.*}` keys.
 | `mappability_bed` | `mappability_bed` | awk, bedtools | identical score filter + `-d 100` merge |
 | `callable_sites_bed` | `callable_sites_bed` | bedtools | identical sort/merge of coverage + mappability BEDs |
 | postprocess module (`filter_individuals`, `basic_filter`, `update_bed`, `strict_filter`, `subset_snps`, `subset_indels`, `drop_indel_SNPs`) | `postprocess_filter_individuals` … `postprocess_drop_indel_snps` | bcftools 1.23, awk, bedtools, tabix | identical commands; `scripts/write_include_samples.py` for the sample list; AF upper bound computed as `1 - maf` (upstream `1-{params.maf}`) |
-| qc module (`contig_map`, `vcftools_individuals`, `subsample_snps`, `prepare_plink_inputs`, `copy_qc_report`, `plink`, `setup_admixture`, `admixture`, `qc_dashboard`) | `qc_contig_map` … `qc_dashboard` | vcftools 0.1.16, bcftools 1.23, plink2/plink, admixture, R | identical commands; logic ported to `scripts/contig_map.py`, `vcftools_individuals.py`, `prepare_plink_inputs.py`, `contigs4admixture.py`, `qc_dashboard_render.R` |
+| qc module (`contig_map`, `vcftools_individuals`, `subsample_snps`, `prepare_plink_inputs`, `copy_qc_report`, `plink`, `setup_admixture`, `admixture`, `generate_coords_file`, `qc_dashboard`) | `qc_contig_map` … `qc_dashboard` | vcftools 0.1.16, bcftools 1.23, plink2/plink, admixture, R | identical commands; logic ported to `scripts/contig_map.py`, `vcftools_individuals.py`, `prepare_plink_inputs.py`, `contigs4admixture.py`, `generate_coords.py`, `qc_dashboard_render.R`. `generate_coords_file` reads the optional `sample_metadata` CSV (lat/long) into `results/qc/coords.txt`, consumed by the dashboard's terrain-map panel when `qc_google_api_key` is set; without metadata it writes the empty placeholder (upstream's own else branch) so the panel just prints its placeholder text |
 | `setup` / `download_reads` / `map_samples` / `call_variants` / `qc_report` / `callable_sites` / `gvcfs` (Snakefile aggregation targets) | n/a | — | Snakemake target rules, no commands of their own |
 
 ### Remaining exclusions (structurally impossible in oxo-flow)
 
 | Item | Why excluded | Evidence |
 |---|---|---|
-| `intervals.enabled` interval scatter (`picard_intervals`, `create_gvcf_intervals`, `create_db_intervals`, `gatk_haplotypecaller_interval`, `concat_interval_gvcfs*`, `concat_interval_vcfs*`, `compress_interval_raw_vcf`, `normalize_external_gvcf_for_gatk`, `archive_gatk_gvcf`) | upstream uses snakemake **checkpoints** (`create_gvcf_intervals` at `workflow/rules/intervals.smk:59`, `create_db_intervals` at `:89`) that extend the DAG at runtime from intermediate files; oxo-flow's DAG is static, so per-interval fan-out cannot be planned | `intervals.smk:59,89` (`checkpoint`), `variant_calling/gatk.smk` consumes `intervals.enabled` via checkpoints |
-| `bcftools_call` (bcftools caller) | depends on `bcftools_regions` **checkpoint** (`variant_calling/bcftools.smk:13`) which computes regions from the runtime `callable_sites.bed`; same static-DAG limitation, and the checkpoint also writes the per-sample gVCF into the same output paths the GATK/DeepVariant branches produce (runtime producer selection) | `variant_calling/bcftools.smk:13` (`checkpoint bcftools_regions`), `:42,:55` |
+| `intervals.enabled` interval scatter (`picard_intervals`, `create_gvcf_intervals`, `create_db_intervals`, `gatk_haplotypecaller_interval`, `concat_interval_gvcfs*`, `concat_interval_vcfs*`, `compress_interval_raw_vcf`, long-contig mode's `normalize_external_gvcf_for_gatk`, `archive_gatk_gvcf`) | upstream uses snakemake **checkpoints** (`create_gvcf_intervals` at `workflow/rules/intervals.smk:59`, `create_db_intervals` at `:89`) that enumerate the per-interval `*-scattered.interval_list` files produced by one runtime `gatk SplitIntervals --scatter-count N` call; oxo-flow's DAG is static, so the per-interval fan-out over those runtime-discovered files cannot be planned (the count is config-derived, but the file list is not) | `intervals.smk:59,89` (`checkpoint`), `variant_calling/gatk.smk` consumes `intervals.enabled` via checkpoints |
+| `bcftools_call` (bcftools caller) | depends on the `bcftools_regions` **checkpoint** (`variant_calling/bcftools.smk:13`) which enumerates the reference contigs from the runtime `.fai` into a `regions.tsv`; `bcftools_call` then fans out one mpileup+call per region. The region count is unknown until `index_reference` has run, and the per-region VCFs land in `results/vcfs/regions/` — a runtime-discovered fan-out the static DAG cannot plan | `variant_calling/bcftools.smk:13` (`checkpoint bcftools_regions`), `:42,:55` |
 | parabricks (all `parabricks_*` rules) | requires `--nv` GPU passthrough (upstream `parabricks.smk` runs `--nv` images with `nvidia-docker`); the oxo-flow docker backend has no `--nv` support and no GPU device declaration; additionally NVIDIA EULA/license enforcement cannot be guaranteed in CI | `variant_calling/parabricks.smk` (every rule is `--nv`) |
 | sentieon (all `sentieon_*` rules) | proprietary tool gated on a `SENTIEON_LICENSE` server and a pre-installed license; cannot be distributed or verified in a community port | `config/config.yaml` `sentieon` section; `workflow/rules/sentieon.smk` |
 | `denovo` and `structural_variants` pipeline sections | do not exist as rules in upstream v2.2 | grep of `workflow/` at e0e7a94 finds neither rule set |
-| `gvcf` input type (`normalize_external_gvcf_for_gatk`) | external per-sample paths (arbitrary filesystem locations) cannot feed `expand_inputs` group expansion, which requires a uniform `{sample}` pattern under the workflow root | `variant_calling/gatk.smk:57` (`rule normalize_external_gvcf_for_gatk`) |
-| `generate_coords_file` (qc module) | upstream generates a `coords.tsv` from sample sheet `lat`/`long` columns; the port's sample-group model has no lat/long metadata, and it only feeds the excluded gvcf-input dashboard variant | `modules/qc/Snakefile` `generate_coords_file` |
-| per-sample `mark_duplicates` override | upstream reads the value from the sample sheet per row; the port maps it to the global `mark_duplicates` config key | `config/config.yaml` `mark_duplicates` vs `workflow/snakefiles` per-sample handling |
+| per-sample `mark_duplicates` override | upstream reads the value from the sample sheet per row (default `true`); the port maps it to the global `mark_duplicates` config key (default `false`), which every markdup/no-markdup branch gate reads. A per-group override would require restructuring all branch gates and still cannot match upstream's per-row semantics | `config/config.yaml` `mark_duplicates` vs `workflow/snakefiles` per-sample handling |
 | multi-library / multi-unit rows (library_id, input_unit) | the sample-group model has one unit per sample; consumers of `results/bams/raw/{sample}/{sample}/u1.bam` are hard-coded to the `u1` unit | sample sheet semantics in upstream `README` |
 
 ### Documented deviations from upstream
@@ -196,8 +200,10 @@ references are resolved to their upstream values or to `{config.*}` keys.
 2. **postprocess/qc modules consume `results/vcfs/raw.vcf.gz`**, not upstream's `FINAL_VCF` (which is the hard-filtered VCF when `generate_filtered_vcf: true` and GATK is used). The modules were run on the raw joint VCF. The difference only matters when combining GATK + `generate_filtered_vcf` + a module, and reproduces upstream behavior for the DeepVariant path.
 3. **Long-contig CSI mode not ported for postprocess**: upstream conditionally uses CSI indexes when contigs exceed 512 Mb (`regions_to_index`); the port always uses the default TBI short mode. Applicable only to genomes with >512 Mb contigs.
 4. **`glnexus_joint` memory**: upstream computes `mem_gbytes` from the default profile's `mem_mb_reduced`; the port inlines the resulting value 8 (with the same `if < 1 then 1` clamp).
-5. **`combine_qc_metrics` with mixed input types**: its `expand_inputs` references `results/fastp/{sample}/{sample}/u1.json` for every sample, which only exists for fastq/srr samples — for bam-input cohorts the fastp stats expand fails at plan time. Use fastq/srr groups when combining QC metrics.
+5. **QC-metrics and callable-sites branches with non-fastq input types**: `combine_qc_metrics` and the callable-sites `expand_inputs` reference `results/fastp/{sample}/{sample}/u1.json` / `results/callable_sites/depths/{sample}.*` for every sample, which only exist for fastq/srr (fastp stats) or BAM-bearing samples (depths). For bam/gvcf cohorts the expands fail at plan time. Use fastq/srr groups when combining QC metrics or computing callable sites.
 6. **`fasterq-dump --tmpdir` dropped** (no per-rule tmpdir in oxo-flow); SRA downloads use the current directory.
+7. **gvcf inputs are accepted on any caller**: upstream hard-fails gvcf inputs with non-GATK callers (bcftools/deepvariant/parabricks); the port normalizes them regardless, so the DeepVariant GLnexus path also accepts them. Normalized gVCFs are valid GLnexus input, so this is a relaxation, not a behavior change.
+8. **`coords.txt` is always produced in qc mode**: upstream only creates it when the metadata CSV actually has lat/long rows; the port writes the same file empty otherwise (upstream's own placeholder branch), so the dashboard's map panel shows its placeholder text instead of being absent.
 
 Version pinning: upstream envs declare only `>=` ranges with no lockfile;
 exact pins (fastp 1.3.6, samtools 1.24, bwa 0.7.19, gatk4 4.6.2.0, bcftools
