@@ -106,7 +106,6 @@
     "denovo — no such step in upstream v2.2",
     "structural_variants — no such step in upstream v2.2",
     "multi-library/multi-unit sample-sheet rows — the sample-group model is one unit per sample; per-library fan-out (library_id/input_unit) has no model dimension and consumers are hard-coded to the u1 unit",
-    "per-sample mark_duplicates override — upstream reads the value per sample-sheet row (default true); the port maps it to the global mark_duplicates config key (default false)",
     "interval-mode compress_interval_raw_vcf and long-contig (CSI) paths — the port's concat_interval_vcfs consumes GATK -Oz outputs directly and always uses TBI (short-contig) indexing"
   ],
   "rule_count": 74,
