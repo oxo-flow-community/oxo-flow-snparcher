@@ -96,6 +96,11 @@ qc_clusters = 3
 qc_pca_dims = 10
 qc_google_api_key = ""
 sample_metadata = ""
+# Library fan-out dimension (issue #18): comma-separated library/unit ids,
+# consumed by the {library} [[values]]-keyed paths and the merge gathers.
+# Default "u1" matches the single-library port exactly; multi-library
+# cohorts: --arg library_ids=u1,u2 (see [[values]] comment above).
+library_ids = "u1"
 
 [defaults]
 memory = "8G"
@@ -137,6 +142,17 @@ memory = "8G"
 name = "cohort"
 samples = ["sample1", "sample2", "sample3"]
 metadata = { input_type = "fastq" }
+
+# Library dimension (issue #18): upstream fans out per library_id/input_unit;
+# the port collapsed it to one unit (u1). The [[values]] table makes {library}
+# an engine fan-out dimension with the single-library default byte-identical
+# to the pre-change port. Multi-library cohorts: set
+# config.library_ids = "u1,u2" (CLI override or profile) and wire per-library
+# FASTQ sources; the merge chain gathers every library's BAM into the
+# per-sample merge.
+[[values]]
+name = "library"
+values = ["u1"]
 
 # ---------------------------------------------------------------------------
 # Reference preparation
@@ -227,9 +243,9 @@ input = [
     "raw/{sample}_2.fastq.gz",
 ]
 output = [
-    "results/filtered_fastqs/{sample}/{sample}/u1_1.fastq.gz",
-    "results/filtered_fastqs/{sample}/{sample}/u1_2.fastq.gz",
-    "results/fastp/{sample}/{sample}/u1.json",
+    "results/filtered_fastqs/{sample}/{sample}/{library}_1.fastq.gz",
+    "results/filtered_fastqs/{sample}/{sample}/{library}_2.fastq.gz",
+    "results/fastp/{sample}/{sample}/{library}.json",
 ]
 when = "wildcard.input_type == 'fastq'"
 log = "logs/fastp/{sample}.txt"
@@ -256,21 +272,21 @@ conda = "envs/fastp.yaml"
 name = "download_sra"
 description = "Download SRA run as paired FASTQs (prefetch/fasterq-dump, ENA via ffq fallback)"
 output = [
-    "results/fastqs/{sample}/{sample}/u1/{accession}_1.fastq.gz",
-    "results/fastqs/{sample}/{sample}/u1/{accession}_2.fastq.gz",
+    "results/fastqs/{sample}/{sample}/{library}/{accession}_1.fastq.gz",
+    "results/fastqs/{sample}/{sample}/{library}/{accession}_2.fastq.gz",
 ]
 when = "wildcard.input_type == 'srr'"
 log = "logs/download_sra/{sample}/{accession}.txt"
 shell = """
 rm -rf {accession}
-mkdir -p results/fastqs/{sample}/{sample}/u1
+mkdir -p results/fastqs/{sample}/{sample}/{library}
 
 if prefetch --max-size 1T {accession} 2>> {log}; then
     fasterq-dump {accession} \\
-        -O results/fastqs/{sample}/{sample}/u1 \\
+        -O results/fastqs/{sample}/{sample}/{library} \\
         -e {threads} \\
         >> {log} 2>&1
-    pigz -p {threads} results/fastqs/{sample}/{sample}/u1/{accession}*.fastq
+    pigz -p {threads} results/fastqs/{sample}/{sample}/{library}/{accession}*.fastq
     rm -rf {accession}
 else
     echo "Prefetch failed, trying ENA via ffq..." >> {log}
@@ -280,7 +296,7 @@ else
             [[ -n "$url" ]] || continue
             echo "Downloading: $url" >> {log}
             curl -fSL "$url" \\
-                -o results/fastqs/{sample}/{sample}/u1/$(basename "$url") \\
+                -o results/fastqs/{sample}/{sample}/{library}/$(basename "$url") \\
                 >> {log} 2>&1
         done
 fi
@@ -299,13 +315,13 @@ conda = "envs/sra.yaml"
 name = "fastp_srr"
 description = "Adapter detection and quality filtering of downloaded SRA read pairs with fastp"
 input = [
-    "results/fastqs/{sample}/{sample}/u1/{accession}_1.fastq.gz",
-    "results/fastqs/{sample}/{sample}/u1/{accession}_2.fastq.gz",
+    "results/fastqs/{sample}/{sample}/{library}/{accession}_1.fastq.gz",
+    "results/fastqs/{sample}/{sample}/{library}/{accession}_2.fastq.gz",
 ]
 output = [
-    "results/filtered_fastqs/{sample}/{sample}/u1_1.fastq.gz",
-    "results/filtered_fastqs/{sample}/{sample}/u1_2.fastq.gz",
-    "results/fastp/{sample}/{sample}/u1.json",
+    "results/filtered_fastqs/{sample}/{sample}/{library}_1.fastq.gz",
+    "results/filtered_fastqs/{sample}/{sample}/{library}_2.fastq.gz",
+    "results/fastp/{sample}/{sample}/{library}.json",
 ]
 when = "wildcard.input_type == 'srr'"
 log = "logs/fastp_srr/{sample}.txt"
@@ -336,18 +352,18 @@ conda = "envs/fastp.yaml"
 name = "bwa_mem"
 description = "Align reads with bwa mem and sort with samtools"
 input = [
-    "results/filtered_fastqs/{sample}/{sample}/u1_1.fastq.gz",
-    "results/filtered_fastqs/{sample}/{sample}/u1_2.fastq.gz",
+    "results/filtered_fastqs/{sample}/{sample}/{library}_1.fastq.gz",
+    "results/filtered_fastqs/{sample}/{sample}/{library}_2.fastq.gz",
     "results/reference/{config.reference_name}.fa.gz",
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
 when = "(wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
-output = ["results/bams/raw/{sample}/{sample}/u1.bam"]
-temp_output = ["results/bams/raw/{sample}/{sample}/u1.bam"]
+output = ["results/bams/raw/{sample}/{sample}/{library}.bam"]
+temp_output = ["results/bams/raw/{sample}/{sample}/{library}.bam"]
 log = "logs/bwa_mem/{sample}.txt"
 shell = """
-bwa mem -M -t {threads} -R "@RG\\tID:{sample}.u1\\tSM:{sample}\\tLB:{sample}\\tPL:ILLUMINA" \
+bwa mem -M -t {threads} -R "@RG\\tID:{sample}.{library}\\tSM:{sample}\\tLB:{sample}\\tPL:ILLUMINA" \
     {input[2]} {input[0]} {input[1]} | samtools sort -o {output[0]} -
 """
 tags = ["alignment"]
@@ -360,12 +376,12 @@ conda = "envs/samtools.yaml"
 
 [[rules]]
 name = "merge_library_bams"
-description = "Merge per-input-unit BAMs into a per-library BAM"
-input = ["results/bams/raw/{sample}/{sample}/u1.bam"]
+description = "Merge a library's per-unit BAMs into the per-library BAM (upstream samtools merge per library_id; v1: one unit per library, so the merge is the unit-to-library promotion)"
+input = ["results/bams/raw/{sample}/{sample}/{library}.bam"]
 when = "(wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
-output = ["results/bams/library/{sample}/{sample}.bam"]
-temp_output = ["results/bams/library/{sample}/{sample}.bam"]
-log = "logs/merge_library_bams/{sample}.txt"
+output = ["results/bams/library/{sample}/{sample}/{library}.bam"]
+temp_output = ["results/bams/library/{sample}/{sample}/{library}.bam"]
+log = "logs/merge_library_bams/{sample}_{library}.txt"
 shell = "samtools merge -f {output[0]} {input[0]}"
 tags = ["alignment"]
 
@@ -374,12 +390,14 @@ conda = "envs/samtools.yaml"
 
 [[rules]]
 name = "merge_library_level_bams"
-description = "Merge per-library BAMs into the final sample BAM (no duplicate marking)"
-input = ["results/bams/library/{sample}/{sample}.bam"]
+description = "Merge per-library BAMs into the final sample BAM (no duplicate marking; gathers every {library})"
+expand_inputs = [
+    { pattern = "results/bams/library/{sample}/{sample}/{library}.bam", variables = { library = "config.library_ids" } }
+]
 when = "(!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = ["results/bams/merged/{sample}.bam"]
 log = "logs/merge_library_level_bams/{sample}.txt"
-shell = "samtools merge -f {output[0]} {input[0]}"
+shell = "samtools merge -f {output[0]} {input}"
 tags = ["alignment"]
 
 [rules.environment]
@@ -388,10 +406,10 @@ conda = "envs/samtools.yaml"
 [[rules]]
 name = "markdup_library"
 description = "Mark duplicate reads per library with sambamba (upstream default branch)"
-input = ["results/bams/library/{sample}/{sample}.bam"]
+input = ["results/bams/library/{sample}/{sample}/{library}.bam"]
 when = "(config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
-output = ["results/bams/library_markdup/{sample}/{sample}.bam"]
-temp_output = ["results/bams/library_markdup/{sample}/{sample}.bam"]
+output = ["results/bams/library_markdup/{sample}/{sample}/{library}.bam"]
+temp_output = ["results/bams/library_markdup/{sample}/{sample}/{library}.bam"]
 log = "logs/markdup/{sample}.txt"
 shell = """
 sambamba markdup -t {threads} {input[0]} {output[0]} 2> {log}
@@ -407,12 +425,14 @@ conda = "envs/sambamba.yaml"
 
 [[rules]]
 name = "merge_dedup_libraries"
-description = "Merge duplicate-marked library BAMs into the final sample BAM"
-input = ["results/bams/library_markdup/{sample}/{sample}.bam"]
+description = "Merge duplicate-marked library BAMs into the final sample BAM (gathers every {library}; upstream samtools merge across library_id)"
+expand_inputs = [
+    { pattern = "results/bams/library_markdup/{sample}/{sample}/{library}.bam", variables = { library = "config.library_ids" } }
+]
 when = "(config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = ["results/bams/markdup/{sample}.bam"]
 log = "logs/merge_dedup_libraries/{sample}.txt"
-shell = "samtools merge -f {output[0]} {input[0]}"
+shell = "samtools merge -f {output[0]} {input}"
 tags = ["alignment"]
 
 [rules.environment]
@@ -1781,7 +1801,7 @@ conda = "envs/gatk.yaml"
 [[rules]]
 name = "collect_fastp_stats"
 description = "Aggregate fastp per-unit stats into a per-sample JSON"
-input = ["results/fastp/{sample}/{sample}/u1.json"]
+input = ["results/fastp/{sample}/{sample}/{library}.json"]
 when = "(wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
 output = ["results/qc_metrics/fastp/{sample}.json"]
 log = "logs/collect_fastp_stats/{sample}.txt"
