@@ -145,14 +145,16 @@ metadata = { input_type = "fastq" }
 
 # Library dimension (issue #18): upstream fans out per library_id/input_unit;
 # the port collapsed it to one unit (u1). The [[values]] table makes {library}
-# an engine fan-out dimension with the single-library default byte-identical
-# to the pre-change port. Multi-library cohorts: set
-# config.library_ids = "u1,u2" (CLI override or profile) and wire per-library
-# FASTQ sources; the merge chain gathers every library's BAM into the
-# per-sample merge.
+# an engine fan-out dimension whose value list follows config.library_ids
+# (values_from, engine >= 0.17): the single-library default is byte-identical
+# to the pre-change port, and multi-library cohorts switch with
+# --arg library_ids=u1,u2 (or a profile). The merge chain gathers every
+# library's BAM into the per-sample merge.
 [[values]]
 name = "library"
 values = ["u1"]
+values_from = "config.library_ids"
+values_from = "config.library_ids"
 
 # ---------------------------------------------------------------------------
 # Reference preparation
