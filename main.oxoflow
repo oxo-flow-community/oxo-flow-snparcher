@@ -18,6 +18,10 @@
 #   joint_genotyping_enabled=true   GATK GenomicsDBImport + GenotypeGVCFs
 #                               (deepvariant: GLnexus joint genotyping)
 #   generate_filtered_vcf=true  GATK hard variant filtration (needs joint VCF)
+#   long_contig_mode='auto'     long-contig (CSI) VCF indexing when any contig
+#                               exceeds the TBI 512 Mb limit (auto/true/false;
+#                               interval-mode GATK chain emits .csi and keeps
+#                               GATK consumers on plain .vcf + .idx)
 #   callable_sites_enabled=true mosdepth/clam coverage + genmap mappability
 #                               -> results/callable_sites/callable_sites.bed
 #   modules_postprocess_enabled=true  postprocess module (needs callable BED)
@@ -57,6 +61,13 @@ intervals_min_nmer = 500
 intervals_min_contig_length = 0
 intervals_db_max_intervals_per_shard = 200
 intervals_db_max_contigs_per_shard = 200
+# Long-contig (CSI) indexing mode: "auto" (default) decides from the reference
+# .fai whether any contig exceeds the TBI limit of 2**29 - 1 (536,870,911) bp
+# (upstream common.smk TBI_MAX_CONTIG_LENGTH / _resolve_long_contig_mode);
+# true forces long-contig (CSI) mode, false forces short-contig (TBI) mode.
+# Long-contig mode emits .csi indexes and keeps GATK consumers on plain VCFs
+# (.idx); short mode is byte-identical to a run without this key.
+long_contig_mode = "auto"
 bcftools_min_mapq = 20
 bcftools_min_baseq = 20
 bcftools_max_depth = 250
@@ -167,6 +178,38 @@ shell = """
 samtools faidx {input[0]}
 samtools dict {input[0]} -o {output[2]}
 bwa index {input[0]}
+"""
+
+[rules.environment]
+conda = "envs/reference.yaml"
+
+[[rules]]
+name = "resolve_long_contig_mode"
+description = "Decide long-contig (CSI) vs short-contig (TBI) indexing mode from the reference .fai (upstream common.smk _resolve_long_contig_mode)"
+input = ["results/reference/{config.reference_name}.fa.gz.fai"]
+output = ["results/reference/{config.reference_name}.contig_mode.txt"]
+when = "config.long_contig_mode != false"
+log = "logs/resolve_long_contig_mode.txt"
+shell = """
+: > {log}
+rm -f results/reference/.long_contig.flag
+LONG=0
+if [ "{config.long_contig_mode}" = "true" ]; then
+    LONG=1
+    echo "mode=explicit-true" >> {log}
+else
+    MAXLEN=$(awk "{if (\\$2 > m) m = \\$2} END {print m+0}" {input[0]})
+    if [ "$MAXLEN" -gt 536870911 ]; then
+        LONG=1
+    fi
+    echo "mode=auto max_contig_length=$MAXLEN" >> {log}
+fi
+if [ "$LONG" = "1" ]; then
+    touch results/reference/.long_contig.flag
+    echo "LONG" > {output[0]}
+else
+    echo "SHORT" > {output[0]}
+fi
 """
 
 [rules.environment]
@@ -550,12 +593,51 @@ input = [
     "results/reference/{config.reference_name}.dict",
     "results/intervals/gvcf/{sample}/{interval}-scattered.interval_list",
 ]
-when = "config.intervals_enabled && config.variant_tool == 'gatk' && (!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "config.intervals_enabled && config.variant_tool == 'gatk' && (!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr') && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/interval_gvcfs/{sample}/{interval}.g.vcf.gz",
     "results/interval_gvcfs/{sample}/{interval}.g.vcf.gz.tbi",
 ]
 log = "logs/gatk_haplotypecaller_interval/{sample}/{interval}.txt"
+shell = """
+gatk HaplotypeCaller \
+    --java-options '-Xmx7000m' \
+    -R {input[2]} \
+    -I {input[0]} \
+    --read-index {input[1]} \
+    -L {input[5]} \
+    -O {output[0]} \
+    -ploidy {config.ploidy} \
+    --native-pair-hmm-threads {threads} \
+    --emit-ref-confidence GVCF \
+    --min-pruning 1 \
+    --min-dangling-branch-length 1
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "gatk_haplotypecaller_interval_long"
+description = "Per-interval HaplotypeCaller to gVCF (interval mode, long-contig CSI, no-markdup BAM)"
+input = [
+    "results/bams/merged/{sample}.bam",
+    "results/bams/merged/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+    "results/intervals/gvcf/{sample}/{interval}-scattered.interval_list",
+]
+when = "config.intervals_enabled && config.variant_tool == 'gatk' && (!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr') && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/interval_gvcfs/{sample}/{interval}.g.vcf",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/gatk_haplotypecaller_interval_long/{sample}/{interval}.txt"
 shell = """
 gatk HaplotypeCaller \
     --java-options '-Xmx7000m' \
@@ -589,12 +671,51 @@ input = [
     "results/reference/{config.reference_name}.dict",
     "results/intervals/gvcf/{sample}/{interval}-scattered.interval_list",
 ]
-when = "config.intervals_enabled && config.variant_tool == 'gatk' && (config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "config.intervals_enabled && config.variant_tool == 'gatk' && (config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr') && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/interval_gvcfs/{sample}/{interval}.g.vcf.gz",
     "results/interval_gvcfs/{sample}/{interval}.g.vcf.gz.tbi",
 ]
 log = "logs/gatk_haplotypecaller_interval_markdup/{sample}/{interval}.txt"
+shell = """
+gatk HaplotypeCaller \
+    --java-options '-Xmx7000m' \
+    -R {input[2]} \
+    -I {input[0]} \
+    --read-index {input[1]} \
+    -L {input[5]} \
+    -O {output[0]} \
+    -ploidy {config.ploidy} \
+    --native-pair-hmm-threads {threads} \
+    --emit-ref-confidence GVCF \
+    --min-pruning 1 \
+    --min-dangling-branch-length 1
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "gatk_haplotypecaller_interval_markdup_long"
+description = "Per-interval HaplotypeCaller to gVCF (interval mode, long-contig CSI, duplicate-marked BAM)"
+input = [
+    "results/bams/markdup/{sample}.bam",
+    "results/bams/markdup/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+    "results/intervals/gvcf/{sample}/{interval}-scattered.interval_list",
+]
+when = "config.intervals_enabled && config.variant_tool == 'gatk' && (config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr') && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/interval_gvcfs/{sample}/{interval}.g.vcf",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/gatk_haplotypecaller_interval_markdup_long/{sample}/{interval}.txt"
 shell = """
 gatk HaplotypeCaller \
     --java-options '-Xmx7000m' \
@@ -628,7 +749,7 @@ input = [
     "results/reference/{config.reference_name}.dict",
     "results/intervals/gvcf/{sample}/{interval}-scattered.interval_list",
 ]
-when = "config.intervals_enabled && config.variant_tool == 'gatk' && wildcard.input_type == 'bam'"
+when = "config.intervals_enabled && config.variant_tool == 'gatk' && wildcard.input_type == 'bam' && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/interval_gvcfs/{sample}/{interval}.g.vcf.gz",
     "results/interval_gvcfs/{sample}/{interval}.g.vcf.gz.tbi",
@@ -657,10 +778,49 @@ threads = 1
 conda = "envs/gatk.yaml"
 
 [[rules]]
+name = "gatk_haplotypecaller_interval_external_long"
+description = "Per-interval HaplotypeCaller to gVCF (interval mode, long-contig CSI, staged external BAM)"
+input = [
+    "results/bams/input/{sample}.bam",
+    "results/bams/input/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+    "results/intervals/gvcf/{sample}/{interval}-scattered.interval_list",
+]
+when = "config.intervals_enabled && config.variant_tool == 'gatk' && wildcard.input_type == 'bam' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/interval_gvcfs/{sample}/{interval}.g.vcf",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/gatk_haplotypecaller_interval_external_long/{sample}/{interval}.txt"
+shell = """
+gatk HaplotypeCaller \
+    --java-options '-Xmx7000m' \
+    -R {input[2]} \
+    -I {input[0]} \
+    --read-index {input[1]} \
+    -L {input[5]} \
+    -O {output[0]} \
+    -ploidy {config.ploidy} \
+    --native-pair-hmm-threads {threads} \
+    --emit-ref-confidence GVCF \
+    --min-pruning 1 \
+    --min-dangling-branch-length 1
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
 name = "concat_interval_gvcfs"
 description = "Merge per-interval gVCFs into the per-sample gVCF (interval mode)"
 input = ["results/interval_gvcfs/{sample}/*.g.vcf.gz"]
-when = "config.intervals_enabled && config.variant_tool == 'gatk' && wildcard.input_type != 'gvcf'"
+when = "config.intervals_enabled && config.variant_tool == 'gatk' && wildcard.input_type != 'gvcf' && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/gvcfs/{sample}.g.vcf.gz",
     "results/gvcfs/{sample}.g.vcf.gz.tbi",
@@ -679,6 +839,31 @@ threads = 1
 
 [rules.environment]
 conda = "envs/bcftools.yaml"
+
+[[rules]]
+name = "concat_interval_gvcfs_long"
+description = "Merge per-interval gVCFs into the per-sample gVCF (interval mode, long-contig CSI; plain .vcf + GATK .idx in the work dir, upstream gatk_intervals.smk convention)"
+input = ["results/interval_gvcfs/{sample}/*.g.vcf"]
+output = [
+    "results/gvcfs/work/{sample}.g.vcf",
+    "results/gvcfs/work/{sample}.g.vcf.idx",
+]
+when = "config.intervals_enabled && config.variant_tool == 'gatk' && {meta.input_type} != 'gvcf' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+depends_on = ["create_gvcf_intervals", "resolve_long_contig_mode"]
+log = "logs/concat_interval_gvcfs_long/{sample}.txt"
+shell = """
+mkdir -p results/gvcfs/work
+bcftools concat -D -a -Ou {input} 2> {log} \
+    | bcftools sort -T . -o {output[0]} 2>> {log}
+gatk IndexFeatureFile -I {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
 
 [[rules]]
 name = "create_db_intervals"
@@ -739,12 +924,61 @@ expand_inputs = [
     { pattern = "results/gvcfs/{sample}.g.vcf.gz", variables = { sample = "config.samples_list" } },
     { pattern = "results/gvcfs/{sample}.g.vcf.gz.tbi", variables = { sample = "config.samples_list" } },
 ]
-when = "config.intervals_enabled && config.joint_genotyping_enabled && config.variant_tool == 'gatk'"
+when = "config.intervals_enabled && config.joint_genotyping_enabled && config.variant_tool == 'gatk' && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/gatk_genomics_db/L{db_interval}.tar",
 ]
 temp_output = ["results/gatk_genomics_db/L{db_interval}.tar"]
 log = "logs/gatk_genomics_db_import_interval/{db_interval}.txt"
+shell = """
+: > {log}
+export TILEDB_DISABLE_FILE_LOCKING=1
+DB_DIR="results/gatk_genomics_db/L{db_interval}"
+rm -rf "$DB_DIR"
+trap 'rm -rf "$DB_DIR"' EXIT
+MERGE_CONTIGS_ARG=$(python scripts/interval_list_tools.py genomicsdb-merge-contigs-arg \\
+    --input {input[4]} \\
+    --threshold 50 2>> {log})
+gatk GenomicsDBImport \
+    --java-options '-Xmx7000m' \
+    --genomicsdb-shared-posixfs-optimizations true \
+    --batch-size 25 \
+    --genomicsdb-workspace-path "$DB_DIR" \
+    --merge-input-intervals $MERGE_CONTIGS_ARG \
+    --reader-threads {threads} \
+    -L {input[4]} \
+    --sample-name-map {input[0]} \
+    >> {log} 2>&1
+tar -cf {output[0]} "$DB_DIR" >> {log} 2>&1
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "gatk_genomics_db_import_interval_long"
+description = "Import all sample gVCFs into one per-shard GenomicsDB workspace (interval mode, long-contig CSI; GATK reads the plain work .vcf + .idx)"
+input = [
+    "results/genomics_db/mapfile.txt",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+    "results/intervals/db/{db_interval}-scattered.interval_list",
+]
+expand_inputs = [
+    { pattern = "results/gvcfs/work/{sample}.g.vcf", variables = { sample = "config.samples_list" } },
+]
+when = "config.intervals_enabled && config.joint_genotyping_enabled && config.variant_tool == 'gatk' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/gatk_genomics_db/L{db_interval}.tar",
+]
+temp_output = ["results/gatk_genomics_db/L{db_interval}.tar"]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/gatk_genomics_db_import_interval_long/{db_interval}.txt"
 shell = """
 : > {log}
 export TILEDB_DISABLE_FILE_LOCKING=1
@@ -783,7 +1017,7 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
-when = "config.intervals_enabled && config.joint_genotyping_enabled && config.variant_tool == 'gatk'"
+when = "config.intervals_enabled && config.joint_genotyping_enabled && config.variant_tool == 'gatk' && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/vcfs/intervals/L{db_interval}.vcf.gz",
     "results/vcfs/intervals/L{db_interval}.vcf.gz.tbi",
@@ -811,10 +1045,46 @@ threads = 1
 conda = "envs/gatk.yaml"
 
 [[rules]]
+name = "gatk_genotype_gvcfs_interval_long"
+description = "Jointly genotype one DB shard (interval mode, long-contig CSI; plain .vcf output)"
+input = [
+    "results/gatk_genomics_db/L{db_interval}.tar",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.intervals_enabled && config.joint_genotyping_enabled && config.variant_tool == 'gatk' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/vcfs/intervals/L{db_interval}.vcf",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/gatk_genotype_gvcfs_interval_long/{db_interval}.txt"
+shell = """
+EXTRACT_DIR=$(mktemp -d .oxo-joint-gvcf.XXXXXX)
+trap 'rm -rf "$EXTRACT_DIR"' EXIT
+tar -xf {input[0]} -C "$EXTRACT_DIR"
+gatk GenotypeGVCFs \
+    --java-options '-Xmx7000m' \
+    -R {input[1]} \
+    --heterozygosity {config.gatk_het_prior} \
+    --genomicsdb-shared-posixfs-optimizations true \
+    -V gendb://"$EXTRACT_DIR/results/gatk_genomics_db/L{db_interval}" \
+    -O {output[0]} \
+    &> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
 name = "concat_interval_vcfs"
 description = "Concatenate per-shard raw VCFs into the joint raw VCF (interval mode)"
 input = ["results/vcfs/intervals/*.vcf.gz"]
-when = "config.intervals_enabled && config.joint_genotyping_enabled && config.variant_tool == 'gatk'"
+when = "config.intervals_enabled && config.joint_genotyping_enabled && config.variant_tool == 'gatk' && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/vcfs/raw.vcf.gz",
     "results/vcfs/raw.vcf.gz.tbi",
@@ -829,6 +1099,34 @@ shell = """
 bcftools concat -D -a -Ou {input} 2> {log} \
     | bcftools sort -T . -Oz -o {output[0]} 2>> {log}
 bcftools index -t {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/bcftools.yaml"
+
+[[rules]]
+name = "concat_interval_vcfs_long"
+description = "Concatenate per-shard raw VCFs into the joint raw VCF (interval mode, long-contig CSI; upstream compress_interval_raw_vcf parity)"
+input = ["results/vcfs/intervals/*.vcf"]
+when = "config.intervals_enabled && config.joint_genotyping_enabled && config.variant_tool == 'gatk' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.csi",
+]
+temp_output = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.csi",
+]
+depends_on = ["create_db_intervals", "resolve_long_contig_mode"]
+log = "logs/concat_interval_vcfs_long.txt"
+shell = """
+bcftools concat -D -a -Ou {input} 2> {log} \
+    | bcftools sort -T . -Oz -o {output[0]} 2>> {log}
+bcftools index -c {output[0]} 2>> {log}
 """
 tags = ["variant-calling"]
 
@@ -1090,9 +1388,23 @@ input = []
 expand_inputs = [
     { pattern = "results/gvcfs/{sample}.g.vcf.gz", variables = { sample = "config.samples_list" } },
 ]
-when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk'"
+when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk' && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = ["results/genomics_db/mapfile.txt"]
 log = "logs/create_db_mapfile.txt"
+script = "scripts/write_joint_gvcf_mapfile.py {output[0]} {input}"
+tags = ["variant-calling"]
+
+[[rules]]
+name = "create_db_mapfile_long"
+description = "Write the GenomicsDB sample-name map from per-sample gVCFs (long-contig CSI; points GATK at the plain work .vcf files)"
+input = []
+expand_inputs = [
+    { pattern = "results/gvcfs/work/{sample}.g.vcf", variables = { sample = "config.samples_list" } },
+]
+when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = ["results/genomics_db/mapfile.txt"]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/create_db_mapfile_long.txt"
 script = "scripts/write_joint_gvcf_mapfile.py {output[0]} {input}"
 tags = ["variant-calling"]
 
@@ -1374,7 +1686,7 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
-when = "config.joint_genotyping_enabled && config.generate_filtered_vcf && config.variant_tool == 'gatk'"
+when = "config.joint_genotyping_enabled && config.generate_filtered_vcf && config.variant_tool == 'gatk' && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/vcfs/filtered.vcf.gz",
     "results/vcfs/filtered.vcf.gz.tbi",
@@ -1397,6 +1709,53 @@ gatk VariantFiltration \
     --invalidate-previous-filters true \
     &> {log}
 bcftools index -f -t {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "variant_filtration_long"
+description = "Apply GATK hard filters to the joint raw VCF (long-contig CSI; GATK cannot read .csi-indexed VCFs, so the raw VCF is converted to plain .vcf in-shell — upstream long-mode filtration feeds .csi to GATK and fails)"
+input = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.joint_genotyping_enabled && config.generate_filtered_vcf && config.variant_tool == 'gatk' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/vcfs/filtered.vcf.gz",
+    "results/vcfs/filtered.vcf.gz.csi",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/variant_filtration_long.txt"
+shell = """
+: > {log}
+TMP=$(mktemp -d .oxo-filt-long.XXXXXX)
+trap 'rm -rf "$TMP"' EXIT
+bcftools view -O v -o "$TMP/raw.vcf" {input[0]} 2>> {log}
+gatk VariantFiltration \
+    -R {input[2]} \
+    -V "$TMP/raw.vcf" \
+    --output {output[0]} \
+    --filter-name "RPRS_filter" \
+    --filter-expression "(vc.isSNP() && (vc.hasAttribute('ReadPosRankSum') && ReadPosRankSum < -8.0)) || ((vc.isIndel() || vc.isMixed()) && (vc.hasAttribute('ReadPosRankSum') && ReadPosRankSum < -20.0)) || (vc.hasAttribute('QD') && QD < 2.0)" \
+    --filter-name "FS_SOR_filter" \
+    --filter-expression "(vc.isSNP() && ((vc.hasAttribute('FS') && FS > 60.0) || (vc.hasAttribute('SOR') &&  SOR > 3.0))) || ((vc.isIndel() || vc.isMixed()) && ((vc.hasAttribute('FS') && FS > 200.0) || (vc.hasAttribute('SOR') &&  SOR > 10.0)))" \
+    --filter-name "MQ_filter" \
+    --filter-expression "vc.isSNP() && ((vc.hasAttribute('MQ') && MQ < 40.0) || (vc.hasAttribute('MQRankSum') && MQRankSum < -12.5))" \
+    --filter-name "QUAL_filter" \
+    --filter-expression "QUAL < 30.0" \
+    --create-output-variant-index false \
+    --invalidate-previous-filters true \
+    >> {log} 2>&1
+bcftools index -f -c {output[0]} 2>> {log}
 """
 tags = ["variant-calling"]
 
