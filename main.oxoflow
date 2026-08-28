@@ -154,7 +154,6 @@ metadata = { input_type = "fastq" }
 name = "library"
 values = ["u1"]
 values_from = "config.library_ids"
-values_from = "config.library_ids"
 
 # ---------------------------------------------------------------------------
 # Reference preparation
