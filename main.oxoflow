@@ -853,7 +853,11 @@ depends_on = ["create_gvcf_intervals", "resolve_long_contig_mode"]
 log = "logs/concat_interval_gvcfs_long/{sample}.txt"
 shell = """
 mkdir -p results/gvcfs/work
-bcftools concat -D -a -Ou {input} 2> {log} \
+for gvcf in {input}; do
+    bgzip -c "$gvcf" > "results/gvcfs/work/$(basename "$gvcf").gz"
+    bcftools index -f "results/gvcfs/work/$(basename "$gvcf").gz"
+done
+bcftools concat -D -a -Ou results/gvcfs/work/*.g.vcf.gz 2> {log} \
     | bcftools sort -T . -o {output[0]} 2>> {log}
 gatk IndexFeatureFile -I {output[0]} 2>> {log}
 """
@@ -1124,7 +1128,12 @@ temp_output = [
 depends_on = ["create_db_intervals", "resolve_long_contig_mode"]
 log = "logs/concat_interval_vcfs_long.txt"
 shell = """
-bcftools concat -D -a -Ou {input} 2> {log} \
+mkdir -p results/vcfs/work
+for vcf in {input}; do
+    bgzip -c "$vcf" > "results/vcfs/work/$(basename "$vcf").gz"
+    bcftools index -f "results/vcfs/work/$(basename "$vcf").gz"
+done
+bcftools concat -D -a -Ou results/vcfs/work/*.vcf.gz 2> {log} \
     | bcftools sort -T . -Oz -o {output[0]} 2>> {log}
 bcftools index -c {output[0]} 2>> {log}
 """
@@ -2165,7 +2174,7 @@ input = [
     "results/vcfs/raw.vcf.gz",
     "results/postprocess/include_samples.txt",
 ]
-when = "config.modules_postprocess_enabled && config.callable_sites_enabled"
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/postprocess/basic.vcf.gz",
     "results/postprocess/basic.vcf.gz.tbi",
@@ -2185,6 +2194,33 @@ tags = ["postprocess"]
 [rules.environment]
 conda = "envs/postprocess_filter.yaml"
 
+[[rules]]
+name = "postprocess_basic_filter_long"
+description = "Remove excluded individuals, sites failing filters, ref=N, alt=., and AF==0 (long-contig CSI indexing)"
+input = [
+    "results/vcfs/raw.vcf.gz",
+    "results/postprocess/include_samples.txt",
+]
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/postprocess/basic.vcf.gz",
+    "results/postprocess/basic.vcf.gz.csi",
+]
+temp_output = [
+    "results/postprocess/basic.vcf.gz",
+    "results/postprocess/basic.vcf.gz.csi",
+]
+depends_on = ["resolve_long_contig_mode"]
+shell = """
+bcftools view -S {input[1]} -f .,PASS {input[0]} -a -U -O u \\
+    | bcftools +fill-tags -Ou \\
+    | bcftools view -m2 -e 'AF==0 | ref="N" | ALT="."' -O z -o {output[0]}
+bcftools index -f -c {output[0]}
+"""
+tags = ["postprocess"]
+
+[rules.environment]
+conda = "envs/postprocess_filter.yaml"
 [[rules]]
 name = "postprocess_update_bed"
 description = "Refine callable-sites BED: remove regions on contigs smaller than the configured threshold"
@@ -2219,7 +2255,7 @@ input = [
     "results/postprocess/basic.vcf.gz",
     "results/postprocess/basic.vcf.gz.tbi",
 ]
-when = "config.modules_postprocess_enabled && config.callable_sites_enabled"
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/postprocess/filtered.vcf.gz",
     "results/postprocess/filtered.vcf.gz.tbi",
@@ -2245,13 +2281,46 @@ tags = ["postprocess"]
 conda = "envs/postprocess_filter.yaml"
 
 [[rules]]
+name = "postprocess_strict_filter_long"
+description = "Apply missingness, MAF, and scaffold-exclusion filters, restricted to callable regions (long-contig CSI indexing)"
+input = [
+    "results/postprocess/callable_sites_filtered.bed",
+    "results/postprocess/basic.vcf.gz",
+    "results/postprocess/basic.vcf.gz.csi",
+]
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/postprocess/filtered.vcf.gz",
+    "results/postprocess/filtered.vcf.gz.csi",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/postprocess/strict_filter_long.txt"
+shell = """
+UPPER_BOUND=$(awk -v m="{config.postprocess_maf}" 'BEGIN { printf "%.6g", 1-m }')
+if [ -z "{config.postprocess_exclude_scaffolds}" ]
+then
+    bcftools view -R {input[0]} -m2 -M2 \\
+        -e "F_MISSING > {config.postprocess_missingness} | AF<{config.postprocess_maf} | AF>$UPPER_BOUND" \\
+        {input[1]} -O z -o {output[0]}
+else
+    bcftools view -t ^{config.postprocess_exclude_scaffolds} -R {input[0]} -m2 -M2 \\
+        -e "F_MISSING > {config.postprocess_missingness} | AF<{config.postprocess_maf} | AF>$UPPER_BOUND" \\
+        {input[1]} -O z -o {output[0]}
+fi
+bcftools index -f -c {output[0]}
+"""
+tags = ["postprocess"]
+
+[rules.environment]
+conda = "envs/postprocess_filter.yaml"
+[[rules]]
 name = "postprocess_subset_indels"
 description = "Extract clean indels from the strictly-filtered VCF"
 input = [
     "results/postprocess/filtered.vcf.gz",
     "results/postprocess/filtered.vcf.gz.tbi",
 ]
-when = "config.modules_postprocess_enabled && config.callable_sites_enabled"
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/postprocess/clean_indels.vcf.gz",
     "results/postprocess/clean_indels.vcf.gz.tbi",
@@ -2267,13 +2336,35 @@ tags = ["postprocess"]
 conda = "envs/postprocess_filter.yaml"
 
 [[rules]]
+name = "postprocess_subset_indels_long"
+description = "Extract clean indels from the strictly-filtered VCF (long-contig CSI indexing)"
+input = [
+    "results/postprocess/filtered.vcf.gz",
+    "results/postprocess/filtered.vcf.gz.csi",
+]
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/postprocess/clean_indels.vcf.gz",
+    "results/postprocess/clean_indels.vcf.gz.csi",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/postprocess/subset_indels_long.txt"
+shell = """
+bcftools view -v indels -O z -o {output[0]} {input[0]}
+bcftools index -f -c {output[0]}
+"""
+tags = ["postprocess"]
+
+[rules.environment]
+conda = "envs/postprocess_filter.yaml"
+[[rules]]
 name = "postprocess_subset_snps"
 description = "Extract SNPs (excluding indel-overlapping sites) from the strictly-filtered VCF"
 input = [
     "results/postprocess/filtered.vcf.gz",
     "results/postprocess/filtered.vcf.gz.tbi",
 ]
-when = "config.modules_postprocess_enabled && config.callable_sites_enabled"
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/postprocess/clean_snps_prefilter.vcf.gz",
     "results/postprocess/clean_snps_prefilter.vcf.gz.tbi",
@@ -2293,13 +2384,39 @@ tags = ["postprocess"]
 conda = "envs/postprocess_filter.yaml"
 
 [[rules]]
+name = "postprocess_subset_snps_long"
+description = "Extract SNPs (excluding indel-overlapping sites) from the strictly-filtered VCF (long-contig CSI indexing)"
+input = [
+    "results/postprocess/filtered.vcf.gz",
+    "results/postprocess/filtered.vcf.gz.csi",
+]
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/postprocess/clean_snps_prefilter.vcf.gz",
+    "results/postprocess/clean_snps_prefilter.vcf.gz.csi",
+]
+temp_output = [
+    "results/postprocess/clean_snps_prefilter.vcf.gz",
+    "results/postprocess/clean_snps_prefilter.vcf.gz.csi",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/postprocess/subset_snps_long.txt"
+shell = """
+bcftools view -v snps -e 'TYPE ~ "indel"' -O z -o {output[0]} {input[0]}
+bcftools index -f -c {output[0]}
+"""
+tags = ["postprocess"]
+
+[rules.environment]
+conda = "envs/postprocess_filter.yaml"
+[[rules]]
 name = "postprocess_drop_indel_snps"
 description = "Remove SNPs that overlap indels (genotype length > 1)"
 input = [
     "results/postprocess/clean_snps_prefilter.vcf.gz",
     "results/postprocess/clean_snps_prefilter.vcf.gz.tbi",
 ]
-when = "config.modules_postprocess_enabled && config.callable_sites_enabled"
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/postprocess/keep_snp_positions.txt",
     "results/postprocess/clean_snps.vcf.gz",
@@ -2326,6 +2443,34 @@ conda = "envs/postprocess_filter.yaml"
 # FINAL_VCF; see README fidelity table.
 # ---------------------------------------------------------------------------
 
+[[rules]]
+name = "postprocess_drop_indel_snps_long"
+description = "Remove SNPs that overlap indels (genotype length > 1) (long-contig CSI indexing)"
+input = [
+    "results/postprocess/clean_snps_prefilter.vcf.gz",
+    "results/postprocess/clean_snps_prefilter.vcf.gz.csi",
+]
+when = "config.modules_postprocess_enabled && config.callable_sites_enabled && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/postprocess/keep_snp_positions.txt",
+    "results/postprocess/clean_snps.vcf.gz",
+    "results/postprocess/clean_snps.vcf.gz.csi",
+]
+temp_output = ["results/postprocess/keep_snp_positions.txt"]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/postprocess/drop_indel_snps_long.txt"
+shell = """
+bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\n' {input[0]} \\
+    | awk 'length($3) == 1 {print $1"\\t"$2}' \\
+    | bgzip -c > {output[0]}
+tabix -C -s1 -b2 -e2 {output[0]}
+bcftools view -T {output[0]} {input[0]} -Oz -o {output[1]}
+bcftools index -f -c {output[1]}
+"""
+tags = ["postprocess"]
+
+[rules.environment]
+conda = "envs/postprocess_filter.yaml"
 [[rules]]
 name = "qc_contig_map"
 description = "Generate a QC-local contig map for PLINK and ADMIXTURE"
