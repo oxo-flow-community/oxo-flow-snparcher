@@ -284,7 +284,7 @@ plan unchanged.
 | parabricks (all `parabricks_*` rules) | requires `--nv` GPU passthrough (upstream `parabricks.smk` runs `--nv` images with `nvidia-docker`); the oxo-flow docker backend has no `--nv` support and no GPU device declaration; additionally NVIDIA EULA/license enforcement cannot be guaranteed in CI | `variant_calling/parabricks.smk` (every rule is `--nv`) |
 | sentieon (all `sentieon_*` rules) | proprietary tool gated on a `SENTIEON_LICENSE` server and a pre-installed license; cannot be distributed or verified in a community port | `config/config.yaml` `sentieon` section; `workflow/rules/sentieon.smk` |
 | `denovo` and `structural_variants` pipeline sections | do not exist as rules in upstream v2.2 | grep of `workflow/` at e0e7a94 finds neither rule set |
-| multi-library / multi-unit rows (library_id, input_unit) | the sample-group model has one unit per sample; consumers of `results/bams/raw/{sample}/{sample}/u1.bam` are hard-coded to the `u1` unit | sample sheet semantics in upstream `README` |
+| multi-library / multi-unit rows (library_id, input_unit) | `{library}` fan-out via the `library` [[values]] table (`values_from = "config.library_ids"`, default `u1` = the single-library port byte-identical); `--arg library_ids=u1,u2` fans fastp_srr/bwa_mem/markdup per library and the merge chain gathers into the per-sample BAM | multi-library FASTQ cohorts on the fastq branch name per-library sources through the SRR branch or external BAM staging (v1: the fastq branch's raw path is per-sample) |
 
 ### Documented deviations from upstream
 
