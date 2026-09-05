@@ -117,7 +117,9 @@
   ],
   "excluded": [
     "parabricks — every rule runs with --nv GPU passthrough (workflow/rules/parabricks.smk); the oxo-flow docker backend has no --nv support, plus NVIDIA EULA/license cannot be enforced",
-    "sentieon — proprietary SENTIEON_LICENSE server gating (config/config.yaml sentieon section); cannot be distributed or verified",
+    "sentieon — proprietary SENTIEON_LICENSE server gating (config/config.yaml sentieon section); cannot be distributed or verified"
+  ],
+  "not_applicable": [
     "denovo — no such step in upstream v2.2",
     "structural_variants — no such step in upstream v2.2"
   ],
