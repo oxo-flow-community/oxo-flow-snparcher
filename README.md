@@ -214,7 +214,7 @@ Created 2026-08-15; this workflow may lag behind upstream releases. Upstream
 license and attribution are recorded in [NOTICE.md](NOTICE.md).
 
 ## Fidelity
-> **Port-side renames of upstream rules** (for upstream claim tracing): `concat_interval_gvcfs_stage` → `concat_interval_gvcfs` / `concat_interval_gvcfs_long`; `concat_interval_vcfs_stage` → `concat_interval_vcfs` / `concat_interval_vcfs_long`; `drop_indel_SNPs` → `postprocess_drop_indel_snps` / `postprocess_drop_indel_snps_long`. The `sentieon`- and `parabricks`-family tools are excluded as commercial (see Excluded).
+> **Port-side renames of upstream rules** (for upstream claim tracing): `concat_interval_gvcfs_stage` → `concat_interval_gvcfs` / `concat_interval_gvcfs_long`; `concat_interval_vcfs_stage` → `concat_interval_vcfs` / `concat_interval_vcfs_long`; `drop_indel_SNPs` → `postprocess_drop_indel_snps` / `postprocess_drop_indel_snps_long`. The commercial families (see Excluded) cover: `parabricks_haplotypecaller`, `parse_sentieon_stats`, `sentieon_combine_gvcf`, `sentieon_haplotyper` (plus the `sentieon_dedup`/`sentieon_*` gate rules).
 
 
 74 rules ported from upstream v2.2 (up from 60), covering every branch that
