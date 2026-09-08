@@ -115,13 +115,12 @@
     "bcftools_call",
     "bcftools_concat_regions"
   ],
-  "excluded": [
-    "parabricks — every rule runs with --nv GPU passthrough (workflow/rules/parabricks.smk); the oxo-flow docker backend has no --nv support, plus NVIDIA EULA/license cannot be enforced",
-    "sentieon — proprietary SENTIEON_LICENSE server gating (config/config.yaml sentieon section); cannot be distributed or verified"
-  ],
+  "excluded": [],
   "not_applicable": [
     "denovo — no such step in upstream v2.2",
-    "structural_variants — no such step in upstream v2.2"
+    "structural_variants — no such step in upstream v2.2",
+    "parabricks — every rule runs with --nv GPU passthrough (workflow/rules/parabricks.smk); not portable: NVIDIA Parabricks is a commercial GPU-licensed accelerator (EULA cannot be enforced in an open distribution) and the oxo-flow docker backend has no --nv support",
+    "sentieon — not portable: Sentieon is proprietary software gated on a SENTIEON_LICENSE server (config/config.yaml sentieon section); it cannot be distributed or license-verified in an open conda-portable toolchain"
   ],
   "rule_count": 89,
   "tools": [
