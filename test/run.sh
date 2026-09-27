@@ -25,12 +25,15 @@ awk '/^author =/{print; print "metadata_file = \"samples.tsv\""; next} {print}' 
 printf 'sample\tmark_duplicates\nsample1\ttrue\nsample2\tfalse\n' > "$md/samples.tsv"
 "$OXO" dry-run "$md/main.oxoflow" --samples first:2 mark_duplicates=false > /tmp/oxo-meta-$$.txt 2>&1
 grep -q "markdup_library_library_u1_cohort_sample1.*\[run" /tmp/oxo-meta-$$.txt || { echo "per-sample markdup override not applied (sample1)"; exit 1; }
-grep -q "merge_library_level_bams_library_u1_cohort_sample2.*\[run" /tmp/oxo-meta-$$.txt || { echo "per-sample nomarkdup override not applied (sample2)"; exit 1; }
+# CI pins engine 1d279b59 (pre-0.17), which predates [[values]] values_from
+# wiring (engine >= 0.17): there the merge gather instance has no library
+# infix, while 0.17+ fans it out as ..._library_u1_.... Accept both eras.
+grep -qE "merge_library_level_bams(_library_u1)?_cohort_sample2.*\[run" /tmp/oxo-meta-$$.txt || { echo "per-sample nomarkdup override not applied (sample2)"; exit 1; }
 # The row wins BOTH directions: with config mark_duplicates=true, sample2's
 # row `false` must still take the no-markdup path (global true overridden).
 "$OXO" dry-run "$md/main.oxoflow" --samples first:2 mark_duplicates=true > /tmp/oxo-meta-true-$$.txt 2>&1
 grep -q "markdup_library_library_u1_cohort_sample1.*\[run" /tmp/oxo-meta-true-$$.txt || { echo "per-sample markdup override not applied (sample1, config true)"; exit 1; }
-grep -q "merge_library_level_bams_library_u1_cohort_sample2.*\[run" /tmp/oxo-meta-true-$$.txt || { echo "row value must win over global true (sample2)"; exit 1; }
+grep -qE "merge_library_level_bams(_library_u1)?_cohort_sample2.*\[run" /tmp/oxo-meta-true-$$.txt || { echo "row value must win over global true (sample2)"; exit 1; }
 ! grep -q "markdup_library_library_u1_cohort_sample2.*\[run" /tmp/oxo-meta-true-$$.txt || { echo "row false must close the markdup gate despite global true (sample2)"; exit 1; }
 # Any other value (e.g. "foo") must NOT override: it falls back to the global
 # key — with config false, sample2 takes the no-markdup path and the markdup
@@ -38,7 +41,7 @@ grep -q "merge_library_level_bams_library_u1_cohort_sample2.*\[run" /tmp/oxo-met
 printf 'sample\tmark_duplicates\nsample1\ttrue\nsample2\tfoo\n' > "$md/samples.tsv"
 "$OXO" dry-run "$md/main.oxoflow" --samples first:2 > /tmp/oxo-meta-foo-$$.txt 2>&1
 grep -q "markdup_library_library_u1_cohort_sample1.*\[run" /tmp/oxo-meta-foo-$$.txt || { echo "per-sample markdup override not applied (sample1, non-boolean value case)"; exit 1; }
-grep -q "merge_library_level_bams_library_u1_cohort_sample2.*\[run" /tmp/oxo-meta-foo-$$.txt || { echo "non-boolean value must fall back to global (sample2)"; exit 1; }
+grep -qE "merge_library_level_bams(_library_u1)?_cohort_sample2.*\[run" /tmp/oxo-meta-foo-$$.txt || { echo "non-boolean value must fall back to global (sample2)"; exit 1; }
 ! grep -q "markdup_library_library_u1_cohort_sample2.*\[run" /tmp/oxo-meta-foo-$$.txt || { echo "non-boolean value must not open the markdup gate (sample2 double-run)"; exit 1; }
 rm -rf "$md"
 
