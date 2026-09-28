@@ -94,7 +94,13 @@ qc_max_sample_missingness = 0.49
 qc_exclude_scaffolds = ""
 qc_clusters = 3
 qc_pca_dims = 10
-qc_google_api_key = ""
+# The Maps/terrain panel of the upstream qc dashboard needs a Google API
+# key. Declared sensitive (engine >= 0.17): the value is masked on disk in
+# command records, logs, and the checkpoint instead of landing in plaintext
+# (lint W032). Provide it at runtime without touching this file:
+#   oxo-flow run main.oxoflow modules_qc_enabled=true \
+#     --qc_google_api_key "$GOOGLE_MAPS_API_KEY"
+qc_google_api_key = { default = "", sensitive = true }
 sample_metadata = ""
 # Library fan-out dimension (issue #18): comma-separated library/unit ids,
 # consumed by the {library} [[values]]-keyed paths and the merge gathers.
