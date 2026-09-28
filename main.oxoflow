@@ -906,7 +906,7 @@ shell = """
 : > {log}
 mkdir -p results/intervals/db
 raw_dir=$(mktemp -d results/intervals/db/gatk_split_raw.XXXXXX)
-trap 'rm -rf "$raw_dir"' EXIT
+trap 'rm -rf "$raw_dir";' EXIT
 NUM_SAMPLES=$(echo "{config.samples_list}" | tr ',' '\n' | grep -c . || true)
 DB_SCATTER=$(awk -v n="$NUM_SAMPLES" -v f="{config.intervals_db_scatter_factor}" -v g="{config.intervals_scatter_count}" 'BEGIN { c = int(f * n * g); print (c < 1 ? 1 : c) }')
 gatk SplitIntervals \
@@ -960,7 +960,7 @@ shell = """
 export TILEDB_DISABLE_FILE_LOCKING=1
 DB_DIR="results/gatk_genomics_db/L{db_interval}"
 rm -rf "$DB_DIR"
-trap 'rm -rf "$DB_DIR"' EXIT
+trap 'rm -rf "$DB_DIR";' EXIT
 MERGE_CONTIGS_ARG=$(python scripts/interval_list_tools.py genomicsdb-merge-contigs-arg \\
     --input {input[4]} \\
     --threshold 50 2>> {log})
@@ -1009,7 +1009,7 @@ shell = """
 export TILEDB_DISABLE_FILE_LOCKING=1
 DB_DIR="results/gatk_genomics_db/L{db_interval}"
 rm -rf "$DB_DIR"
-trap 'rm -rf "$DB_DIR"' EXIT
+trap 'rm -rf "$DB_DIR";' EXIT
 MERGE_CONTIGS_ARG=$(python scripts/interval_list_tools.py genomicsdb-merge-contigs-arg \\
     --input {input[4]} \\
     --threshold 50 2>> {log})
@@ -1050,7 +1050,7 @@ output = [
 log = "logs/gatk_genotype_gvcfs_interval/{db_interval}.txt"
 shell = """
 EXTRACT_DIR=$(mktemp -d .oxo-joint-gvcf.XXXXXX)
-trap 'rm -rf "$EXTRACT_DIR"' EXIT
+trap 'rm -rf "$EXTRACT_DIR";' EXIT
 tar -xf {input[0]} -C "$EXTRACT_DIR"
 gatk GenotypeGVCFs \
     --java-options '-Xmx7000m' \
@@ -1086,7 +1086,7 @@ depends_on = ["resolve_long_contig_mode"]
 log = "logs/gatk_genotype_gvcfs_interval_long/{db_interval}.txt"
 shell = """
 EXTRACT_DIR=$(mktemp -d .oxo-joint-gvcf.XXXXXX)
-trap 'rm -rf "$EXTRACT_DIR"' EXIT
+trap 'rm -rf "$EXTRACT_DIR";' EXIT
 tar -xf {input[0]} -C "$EXTRACT_DIR"
 gatk GenotypeGVCFs \
     --java-options '-Xmx7000m' \
@@ -1509,7 +1509,7 @@ temp_output = [
 log = "logs/joint_genotype_gvcfs.txt"
 shell = """
 EXTRACT_DIR=$(mktemp -d .oxo-joint-gvcf.XXXXXX)
-trap 'rm -rf "$EXTRACT_DIR"' EXIT
+trap 'rm -rf "$EXTRACT_DIR";' EXIT
 tar -xf {input[0]} -C "$EXTRACT_DIR"
 gatk GenotypeGVCFs \
     --java-options '-Xmx7000m' \
@@ -1549,7 +1549,7 @@ log = "logs/glnexus_joint.txt"
 shell = """
 glnexus_db="results/vcfs/GLnexus.DB"
 rm -rf "$glnexus_db"
-trap 'rm -rf "$glnexus_db"' EXIT
+trap 'rm -rf "$glnexus_db";' EXIT
 
 glnexus_mem_gbytes=8
 if [ "$glnexus_mem_gbytes" -lt 1 ]; then
@@ -1768,7 +1768,7 @@ log = "logs/variant_filtration_long.txt"
 shell = """
 : > {log}
 TMP=$(mktemp -d .oxo-filt-long.XXXXXX)
-trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP";' EXIT
 bcftools view -O v -o "$TMP/raw.vcf" {input[0]} 2>> {log}
 gatk VariantFiltration \
     -R {input[2]} \
