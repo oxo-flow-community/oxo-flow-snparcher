@@ -2692,8 +2692,17 @@ input = []
 when = "config.modules_qc_enabled"
 output = ["results/qc/coords.txt"]
 log = "logs/qc/generate_coords_file.txt"
-script = "scripts/generate_coords.py {config.sample_metadata} {output[0]}"
+shell = """
+# The engine drops empty script args; keep the (possibly empty) metadata path
+# as a quoted shell variable so python always receives both arguments.
+# Without an environment the script also runs under system python3 (no pandas).
+SAMPLE_METADATA="{config.sample_metadata}"
+python scripts/generate_coords.py "$SAMPLE_METADATA" {output[0]}
+"""
 tags = ["qc-module"]
+
+[rules.environment]
+conda = "envs/qc_admixture.yaml"
 
 [[rules]]
 name = "qc_dashboard"
