@@ -2678,13 +2678,20 @@ output = [
 ]
 log = "logs/qc/admixture.txt"
 shell = """
-cp {input[3]} {input[1]} 2> {log}
+# Work on a private copy of the bed/bim/fam triple so the declared inputs are
+# never mutated in place (mutating {input[1]} triggered the engine's
+# "input changed while the rule was running" warning and broke provenance).
+# ADMIXTURE requires a shared prefix, so copy bed/fam alongside the fixed bim.
+cp {input[0]} results/qc/plink.admixture.bed 2>> {log}
+cp {input[2]} results/qc/plink.admixture.fam 2>> {log}
+cp {input[3]} results/qc/plink.admixture.bim 2>> {log}
 
-admixture {input[0]} 2 >> {log} 2>&1
-admixture {input[0]} 3 >> {log} 2>&1
+admixture results/qc/plink.admixture.bed 2 >> {log} 2>&1
+admixture results/qc/plink.admixture.bed 3 >> {log} 2>&1
 
 mv plink.2.* results/qc >> {log} 2>&1
 mv plink.3.* results/qc >> {log} 2>&1
+rm -f results/qc/plink.admixture.bed results/qc/plink.admixture.bim results/qc/plink.admixture.fam >> {log} 2>&1
 """
 tags = ["qc-module"]
 
