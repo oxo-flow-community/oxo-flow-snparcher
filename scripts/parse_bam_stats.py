@@ -3,7 +3,11 @@
 
 Port of the snpArcher `parse_bam_stats` run block
 (workflow/rules/qc_metrics.smk): weighted-mean depth from the coverage
-table, read counts from the TSV flagstat output.
+table, read counts from the TSV flagstat output. v2.3.0 keys the flagstat
+lines by their description column (samtools labels the rows; positional
+access breaks across samtools releases and on unpaired BAMs), and reports
+"properly paired %" as None (NA in the combined report) when the library is
+unpaired.
 
 Usage: parse_bam_stats.py <coverage.txt> <flagstat.txt> <output.json>
 """
@@ -45,18 +49,27 @@ def main(argv):
         else 0
     )
 
-    # Parse flagstat
+    # Parse flagstat -O tsv: QC-passed count, QC-failed count, description.
+    flagstat = {}
     with open(flagstat_file) as f:
-        lines = f.readlines()
+        for line in f:
+            passed, _failed, description = line.rstrip("\n").split("\t")
+            flagstat[description] = passed
 
-    total_reads = int(lines[0].split()[0])
-    num_dups = int(lines[4].split()[0])
-    num_mapped = int(lines[6].split()[0])
-    pct_mapped = (
-        float(lines[7].split()[0].strip("%")) if total_reads > 0 else 0
-    )
+    def flagstat_percent(description):
+        value = flagstat[description].rstrip("%")
+        return None if value == "N/A" else float(value)
+
+    # Count primary records only. Secondary and supplementary records are
+    # extra alignments of reads already counted, and would inflate the read
+    # total and skew the mapping and duplicate rates.
+    total_reads = int(flagstat["primary"])
+    num_dups = int(flagstat["primary duplicates"])
+    num_mapped = int(flagstat["primary mapped"])
+    pct_mapped = flagstat_percent("primary mapped %") if total_reads > 0 else 0
+    # None (NA in the report) for an unpaired BAM, which has no pairs.
     pct_proper_paired = (
-        float(lines[14].split()[0].strip("%")) if total_reads > 0 else 0
+        flagstat_percent("properly paired %") if total_reads > 0 else 0
     )
 
     out = {
@@ -65,9 +78,9 @@ def main(argv):
         "num_mapped": num_mapped,
         "percent_mapped": pct_mapped,
         "num_duplicates": num_dups,
-        "percent_duplicates": (num_dups / total_reads * 100)
-        if total_reads > 0
-        else 0,
+        "percent_duplicates": (
+            num_dups / total_reads * 100 if total_reads > 0 else 0
+        ),
         "percent_properly_paired": pct_proper_paired,
         "mean_depth": mean_depth,
         "covered_bases": covered_bases,

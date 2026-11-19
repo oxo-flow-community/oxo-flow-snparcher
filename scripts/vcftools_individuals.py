@@ -156,6 +156,18 @@ def _write_sample_filter(depth_path, samples, samps_path, min_depth, log_path):
                 "No finite per-sample SNP depth values were available; "
                 "skipping min_depth sample filter and retaining all VCF samples.\n"
             )
+    elif not passing:
+        # v2.3.0: fail loudly instead of writing an empty include list, which
+        # downstream rules would only notice as a cryptic empty-cohort error.
+        message = (
+            f"The QC min_depth filter removed all {finite_depths} samples: none "
+            f"has a mean SNP depth above config.qc_min_depth ({min_depth}); "
+            f"see {depth_path} for per-sample depths. Lower qc_min_depth for "
+            "low-depth or downsampled data, or disable the QC module.\n"
+        )
+        with open(log_path, "a") as handle:
+            handle.write(message)
+        raise ValueError(message)
     with open(samps_path, "w") as handle:
         for sample in passing:
             handle.write(f"{sample}\n")

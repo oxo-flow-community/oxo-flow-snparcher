@@ -82,7 +82,11 @@ def main(argv):
                     f"{bam['percent_mapped']:.2f}",
                     str(bam["num_duplicates"]),
                     f"{bam['percent_duplicates']:.2f}",
-                    f"{bam['percent_properly_paired']:.2f}",
+                    (
+                        f"{bam['percent_properly_paired']:.2f}"
+                        if bam["percent_properly_paired"] is not None
+                        else "NA"
+                    ),
                     f"{bam['mean_depth']:.2f}",
                     str(bam["covered_bases"]),
                 ]

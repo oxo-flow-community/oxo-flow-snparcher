@@ -22,11 +22,11 @@ def main():
     if not contigs:
         raise ValueError(f"Reference FAI is empty: {fai_path}")
 
-    all_numeric = all(c.replace(".", "", 1).isdigit() for c in contigs)
-    if all_numeric:
-        plink_contigs = [f"qcctg{i}" for i in range(1, len(contigs) + 1)]
-    else:
-        plink_contigs = list(contigs)
+    # v2.3.0: the plink labels are always the positional qcctgN names, not
+    # only when every contig already looks numeric.  QC-internal labels only
+    # (the contig map drives the --rename-chrs/PLINK pair), so unifying them
+    # removes the mixed-label class of PLINK contig mismatches.
+    plink_contigs = [f"qcctg{i}" for i in range(1, len(contigs) + 1)]
 
     with open(output_path, "w") as handle:
         handle.write("original_contig\tplink_contig\tadmixture_id\n")

@@ -39,8 +39,8 @@
 
 [workflow]
 name = "snparcher"
-version = "2.2.0"
-description = "Variant calling for non-model organisms — fastp, BWA-MEM, GATK HaplotypeCaller. oxo-flow port of harvardinformatics/snparcher v2.2."
+version = "2.3.0"
+description = "Variant calling for non-model organisms — fastp, BWA-MEM, GATK HaplotypeCaller. oxo-flow port of harvardinformatics/snparcher v2.3.0."
 author = "oxo-flow-community"
 # Optional per-sample metadata table (TSV/CSV/JSON keyed by sample id, see
 # README "Per-sample mark_duplicates override"): a `mark_duplicates` column
@@ -79,9 +79,16 @@ modules_postprocess_enabled = false
 modules_qc_enabled = false
 gatk_het_prior = 0.005
 deepvariant_model_type = "WGS"
-callable_sites_min_coverage = "auto"
-callable_sites_max_coverage = "auto"
-callable_sites_fraction = 1.0
+# v2.3.0 summed-depth redesign: thresholds come from the cohort's summed-depth
+# distribution (clam depths.zarr), not per-sample mosdepth means. min_sample_depth
+# is the reads-a-sample-needs-at-a-site cutoff, fraction the fraction of samples
+# that must have data at a site; max_depth "auto" is an outlier cutoff on the
+# summed depth (robust SDs above its median given by max_depth_k), or a multiple
+# of the median (e.g. 1.5). Upstream callable_sites.coverage.* defaults.
+callable_sites_min_sample_depth = 1
+callable_sites_fraction = 0.25
+callable_sites_max_depth = "auto"
+callable_sites_max_depth_k = 4
 callable_sites_merge_distance = 100
 callable_sites_kmer = 150
 callable_sites_min_score = 1
@@ -277,7 +284,7 @@ conda = "envs/fastp.yaml"
 
 [[rules]]
 name = "download_sra"
-description = "Download SRA run as paired FASTQs (prefetch/fasterq-dump, ENA via ffq fallback)"
+description = "Download SRA run as paired FASTQs (spot-order fasterq-dump, cSRA sam-dump|collate|fastq path, ENA md5-verified fallback)"
 output = [
     "results/fastqs/{sample}/{sample}/{library}/{accession}_1.fastq.gz",
     "results/fastqs/{sample}/{sample}/{library}/{accession}_2.fastq.gz",
@@ -285,30 +292,254 @@ output = [
 when = "wildcard.input_type == 'srr'"
 log = "logs/download_sra/{sample}/{accession}.txt"
 shell = """
-rm -rf {accession}
-mkdir -p results/fastqs/{sample}/{sample}/{library}
+# This rule pipes, and the default shell does not enable pipefail. Without
+# it a failing sam-dump mid-stream still leaves samtools fastq exiting 0, and
+# the rule reports success on a truncated FASTQ.
+set -o pipefail
 
-if prefetch --max-size 1T {accession} 2>> {log}; then
-    fasterq-dump {accession} \\
-        -O results/fastqs/{sample}/{sample}/{library} \\
-        -e {threads} \\
-        >> {log} 2>&1
-    pigz -p {threads} results/fastqs/{sample}/{sample}/{library}/{accession}*.fastq
-    rm -rf {accession}
+OUTDIR=results/fastqs/{sample}/{sample}/{library}
+mkdir -p "$OUTDIR"
+
+# Everything this rule downloads or spills lives in one job-private
+# directory, removed on exit however the job ends. prefetch previously wrote
+# into the working directory, so concurrent jobs shared the accession namespace
+# and a sibling's cleanup could delete an in-flight download.
+WORK=$(mktemp -d "$OUTDIR/sra_{accession}_work_XXXXXX")
+# Extracted and downloaded FASTQs land in OUT, beside the outputs so the
+# final move is a rename, and only the declared pair leaves it.
+OUT="$OUTDIR/{accession}_extract"
+rm -rf "$OUT"
+mkdir -p "$OUT"
+trap 'rm -rf "$WORK" "$OUT"' EXIT
+
+SEQ=0
+ALIGNED=0
+EXPECTED=""
+EXPECTED_SOURCE=""
+# Reads the extractor legitimately leaves outside the pair. Only the aligned
+# path produces them, and it sets both from the archive.
+EXPECTED_NU=0
+EXPECTED_NS=0
+ENA_PATH=0
+
+if prefetch --max-size 1T -O "$WORK" {accession} 2>> {log}; then
+    # prefetch lays this out as <outdir>/<accession>/<accession>.sra, with any
+    # reference object the run needs alongside it. Every extractor below is
+    # given the file path, so it never resolves the accession over the network.
+    SRA="$WORK/{accession}/{accession}.sra"
+    [ -f "$SRA" ] || SRA="$WORK/{accession}/{accession}.sralite"
+    if [ ! -f "$SRA" ]; then
+        echo "ERROR: {accession}: prefetch exited 0 but no .sra/.sralite is present" \
+             "under $WORK. Refusing to fall back to network streaming." >> {log}
+        exit 1
+    fi
+
+    # Table row counts describing the run's shape: SEQ = spots,
+    # PRIM = aligned reads. PRIM selects the extractor below.
+    SRA_INFO=$(vdb-dump --info "$SRA" 2>/dev/null)
+    echo "$SRA_INFO" | grep -E '^(SEQ|REF|PRIM|SEC) ' >> {log} || true
+    SEQ=$(echo "$SRA_INFO" | awk -F: '$1 ~ /^SEQ/ {gsub(/[^0-9]/, "", $2); print $2; exit}')
+    PRIM=$(echo "$SRA_INFO" | awk -F: '$1 ~ /^PRIM/ {gsub(/[^0-9]/, "", $2); print $2; exit}')
+    SEQ=${SEQ:-0}
+    PRIM=${PRIM:-0}
+
+    if [ "$PRIM" -gt 0 ]; then
+        ALIGNED=1
+        # Reference-aligned (cSRA) submission: reads are stored in reference
+        # order, so a spot-ordered extractor (fasterq-dump) random-accesses the
+        # whole reference once per read and degrades without bound. sam-dump
+        # reads in reference order (sequential); samtools collate restores name
+        # grouping and samtools fastq writes the pairs. sam-dump is
+        # single-threaded; the remaining threads split between the two
+        # samtools stages.
+        SAMTOOLS_THREADS=$(( ({threads} - 1) / 2 ))
+        [ "$SAMTOOLS_THREADS" -lt 0 ] && SAMTOOLS_THREADS=0
+
+        # 2 x SEQ is not what this pipe emits: secondary-only reads surface as
+        # singletons and mate-less records as unpaired. Both are properties of
+        # the archive, so predict them from the SEQUENCE table before extracting
+        # (see scripts/csra_expected_reads.awk) and fail on unmodelled layouts.
+        if ! vdb-dump -T SEQUENCE -C READ_LEN,PRIMARY_ALIGNMENT_ID,ALIGNMENT_COUNT \
+                -f tab "$SRA" 2>> {log} \
+            | awk -f scripts/csra_expected_reads.awk > "$WORK/census.txt"; then
+            echo "ERROR: {accession}: could not read the SEQUENCE table to predict" \
+                 "what sam-dump will emit." >> {log}
+            exit 1
+        fi
+        sed 's/^/census: /' "$WORK/census.txt" >> {log}
+        # The census must describe the same run vdb-dump --info did; a
+        # disagreement means the table was misread, not that reads are missing.
+        if [ "$(sed -n 's|^spots=||p' "$WORK/census.txt")" != "$SEQ" ] \
+           || [ "$(sed -n 's|^reads_primary=||p' "$WORK/census.txt")" != "$PRIM" ]; then
+            echo "ERROR: {accession}: the census saw $(sed -n 's|^spots=||p' "$WORK/census.txt")" \
+                 "spots and $(sed -n 's|^reads_primary=||p' "$WORK/census.txt") primary" \
+                 "alignments; the run reports SEQ=$SEQ and PRIM=$PRIM." >> {log}
+            exit 1
+        fi
+        if [ "$(sed -n 's|^spots_unmodelled=||p' "$WORK/census.txt")" != 0 ] \
+           || [ "$(sed -n 's|^lines_malformed=||p' "$WORK/census.txt")" != 0 ]; then
+            echo "ERROR: {accession}: $(sed -n 's|^spots_unmodelled=||p' "$WORK/census.txt")" \
+                 "spots do not hold exactly two reads" \
+                 "($(sed -n 's|^lines_malformed=||p' "$WORK/census.txt") unparseable), so what" \
+                 "sam-dump emits for them cannot be predicted." >> {log}
+            exit 1
+        fi
+
+        # -F 0x900 removes only secondary/supplementary copies, so every read
+        # the census predicts must arrive exactly once. collate gets -u: without
+        # it, collate recompresses what samtools fastq would immediately
+        # decompress again. A failure anywhere in the pipe already ends the job
+        # through pipefail; testing it here only puts the cause in the log.
+        if ! sam-dump -u "$SRA" 2>> {log} \
+                | samtools collate -u -O -@ "$SAMTOOLS_THREADS" - "$WORK/collate" 2>> {log} \
+                | samtools fastq -F 0x900 -@ "$SAMTOOLS_THREADS" \
+                    -1 {output[0]} \
+                    -2 {output[1]} \
+                    -0 "$WORK/unpaired.fastq.gz" \
+                    -s "$WORK/singleton.fastq.gz" \
+                    - 2>> {log}; then
+            echo "ERROR: {accession}: the sam-dump | collate | fastq pipe failed, so the" \
+                 "FASTQs are incomplete." >> {log}
+            exit 1
+        fi
+
+        EXPECTED_NS=$(sed -n 's|^singletons=||p' "$WORK/census.txt")
+        EXPECTED_NU=$(sed -n 's|^unpaired=||p' "$WORK/census.txt")
+        EXPECTED=$(( 2 * $(sed -n 's|^pairs=||p' "$WORK/census.txt") + EXPECTED_NS + EXPECTED_NU ))
+        EXPECTED_SOURCE="archive census"
+    else
+        # No alignment table: no reference to walk, so fasterq-dump's
+        # multi-threaded read of the SEQUENCE table is the right access pattern
+        # and sam-dump has no advantage. tee keeps fasterq-dump's messages in
+        # the log even when it fails and the trap removes WORK.
+        mkdir -p "$WORK/fasterq"
+        fasterq-dump "$SRA" \
+            -O "$OUT" \
+            -e {threads} \
+            -t "$WORK/fasterq" \
+            2>&1 | tee "$WORK/fasterq-dump.log" >> {log}
+        pigz -p {threads} "$OUT"/{accession}*.fastq
+
+        # 2 x SEQ is not the right expectation here: fasterq-dump drops
+        # technical and zero-length reads, and a spot need not hold two
+        # biological reads. Use the count the tool reports.
+        EXPECTED=$(awk -F: '/reads written/ {gsub(/[^0-9]/, "", $2); print $2; exit}' \
+            "$WORK/fasterq-dump.log")
+        EXPECTED_SOURCE="fasterq-dump reads-written"
+    fi
 else
+    # prefetch can fail for a single run (NCBI "file unauthorized") while other
+    # runs in the project succeed, so this path must not be gated on something
+    # it cannot produce. ENA publishes an md5 per file, a stronger completeness
+    # check than a count: it catches truncation and corruption exactly.
+    ENA_PATH=1
     echo "Prefetch failed, trying ENA via ffq..." >> {log}
-    ffq --ftp {accession} 2>> {log} \\
-        | jq -r '.[].url' \\
-        | while IFS= read -r url; do
-            [[ -n "$url" ]] || continue
-            echo "Downloading: $url" >> {log}
-            curl -fSL "$url" \\
-                -o results/fastqs/{sample}/{sample}/{library}/$(basename "$url") \\
-                >> {log} 2>&1
-        done
+
+    # Land the file list before looping: a pipeline-fed loop runs in a
+    # subshell, where a failure cannot stop the rule.
+    ffq --ftp {accession} 2>> {log} \
+        | jq -r '.[] | .url + " " + (.md5 // "")' \
+        > "$WORK/ena_files.txt"
+
+    ENA_FILES=0
+    ENA_NO_MD5=0
+    while read -r url md5; do
+        [[ -n "$url" ]] || continue
+        dest="$OUT/$(basename "$url")"
+        echo "Downloading: $url" >> {log}
+        if ! curl -fSL "$url" -o "$dest" >> {log} 2>&1; then
+            echo "ERROR: {accession}: download failed for $url" >> {log}
+            exit 1
+        fi
+        ENA_FILES=$(( ENA_FILES + 1 ))
+        if [ -n "$md5" ]; then
+            if echo "$md5  $dest" | md5sum -c - >> {log} 2>&1; then
+                echo "md5 verified: $dest" >> {log}
+            else
+                echo "ERROR: {accession}: md5 mismatch for $dest; the download is" \
+                     "corrupt or truncated." >> {log}
+                exit 1
+            fi
+        else
+            ENA_NO_MD5=$(( ENA_NO_MD5 + 1 ))
+        fi
+    done < "$WORK/ena_files.txt"
+
+    if [ "$ENA_FILES" -eq 0 ]; then
+        echo "ERROR: {accession}: prefetch failed and ffq returned no ENA files, so" \
+             "there is nothing to download." >> {log}
+        exit 1
+    fi
+    if [ "$ENA_NO_MD5" -ne 0 ]; then
+        echo "WARNING: {accession}: $ENA_NO_MD5 of $ENA_FILES ENA files carried no" \
+             "md5, so their integrity is unverified." >> {log}
+    fi
 fi
 
-[[ -f {output[0]} ]] && [[ -f {output[1]} ]]
+# Move the pair into place; the aligned path already wrote it there. A missing
+# mate is reported by the empty-output check below.
+if [ "$ALIGNED" -eq 0 ]; then
+    [ ! -f "$OUT/{accession}_1.fastq.gz" ] || mv "$OUT/{accession}_1.fastq.gz" {output[0]}
+    [ ! -f "$OUT/{accession}_2.fastq.gz" ] || mv "$OUT/{accession}_2.fastq.gz" {output[1]}
+fi
+
+# The previous test only asked whether the output files exist. That passes
+# for a pigz that compressed nothing, a wall-killed extractor, and silent
+# read loss -- all of which have happened on this rule.
+N1=$(if [ -s "{output[0]}" ]; then pigz -dc "{output[0]}" | wc -l | awk '{print int($1 / 4)}'; else echo 0; fi)
+N2=$(if [ -s "{output[1]}" ]; then pigz -dc "{output[1]}" | wc -l | awk '{print int($1 / 4)}'; else echo 0; fi)
+NORPHAN=$(if [ -s "$OUT/{accession}.fastq.gz" ]; then pigz -dc "$OUT/{accession}.fastq.gz" | wc -l | awk '{print int($1 / 4)}'; else echo 0; fi)
+NU=$(if [ -s "$WORK/unpaired.fastq.gz" ]; then pigz -dc "$WORK/unpaired.fastq.gz" | wc -l | awk '{print int($1 / 4)}'; else echo 0; fi)
+NS=$(if [ -s "$WORK/singleton.fastq.gz" ]; then pigz -dc "$WORK/singleton.fastq.gz" | wc -l | awk '{print int($1 / 4)}'; else echo 0; fi)
+echo "emitted: r1=$N1 r2=$N2 orphan=$NORPHAN unpaired=$NU singleton=$NS" >> {log}
+
+if [ "$N1" -eq 0 ] || [ "$N2" -eq 0 ]; then
+    echo "ERROR: {accession}: empty FASTQ output (r1=$N1 r2=$N2)" >> {log}
+    exit 1
+fi
+if [ "$N1" -ne "$N2" ]; then
+    echo "ERROR: {accession}: mate files disagree (r1=$N1 r2=$N2)" >> {log}
+    exit 1
+fi
+
+# Every read the extractor produced must reach the output files. Both paths
+# check this; they differ only in what the expected count is, because each
+# extractor decides for itself which stored reads to emit.
+TOTAL=$(( N1 + N2 + NORPHAN + NU + NS ))
+echo "completeness: emitted=$TOTAL expected=${EXPECTED:-unknown} (${EXPECTED_SOURCE:-none})" >> {log}
+
+if [ -n "$EXPECTED" ]; then
+    if [ "$TOTAL" -ne "$EXPECTED" ]; then
+        echo "ERROR: {accession}: emitted $TOTAL reads, expected $EXPECTED" \
+             "($EXPECTED_SOURCE). Reads were lost or duplicated." >> {log}
+        exit 1
+    fi
+elif [ "$ENA_PATH" -eq 1 ]; then
+    # Files came from ENA rather than an extractor, so there is no read count
+    # to compare against; completeness was established by the md5 check, which
+    # already exited on mismatch.
+    echo "completeness: established by ENA md5, not by read count" >> {log}
+else
+    echo "ERROR: {accession}: could not determine the expected read count, so" \
+         "completeness cannot be checked. The extractor probably did not run to" \
+         "completion; see the log above." >> {log}
+    exit 1
+fi
+
+if [ "$ALIGNED" -eq 1 ]; then
+    # The total above cannot tell a split pair from two singletons, so any
+    # surplus in -0/-s beyond the archive's prediction means collate failed to
+    # pair mates as stored.
+    if [ "$NU" -ne "$EXPECTED_NU" ] || [ "$NS" -ne "$EXPECTED_NS" ]; then
+        echo "ERROR: {accession}: $NU unpaired and $NS singleton reads were extracted;" \
+             "the archive predicts $EXPECTED_NU and $EXPECTED_NS, so mates were not" \
+             "paired as stored." >> {log}
+        exit 1
+    fi
+    echo "discarded: $NS singleton reads (mate stored only as a secondary alignment)" \
+         "and $NU unpaired reads (the spot's other read is zero-length); r1/r2 carry" \
+         "every complete pair." >> {log}
+fi
 """
 tags = ["read-acquisition"]
 
@@ -498,7 +729,7 @@ conda = "envs/samtools.yaml"
 name = "normalize_external_gvcf_for_gatk"
 description = "Normalize an external gVCF input (recompress + tabix index) for joint genotyping"
 input = ["{gvcf_path}"]
-when = "wildcard.input_type == 'gvcf'"
+when = "wildcard.input_type == 'gvcf' && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/gvcfs/{sample}.g.vcf.gz",
     "results/gvcfs/{sample}.g.vcf.gz.tbi",
@@ -512,6 +743,41 @@ tags = ["variant-calling"]
 
 [rules.environment]
 conda = "envs/bcftools.yaml"
+
+[[rules]]
+name = "normalize_external_gvcf_for_gatk_long"
+description = "Normalize an external gVCF for joint genotyping (long-contig CSI; plain work .vcf + GATK .idx for GATK, compressed CSI archive for the gVCF deliverable)"
+input = ["{gvcf_path}"]
+when = "wildcard.input_type == 'gvcf' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/gvcfs/work/{sample}.g.vcf",
+    "results/gvcfs/work/{sample}.g.vcf.idx",
+    "results/gvcfs/{sample}.g.vcf.gz",
+    "results/gvcfs/{sample}.g.vcf.gz.csi",
+]
+temp_output = [
+    "results/gvcfs/work/{sample}.g.vcf",
+    "results/gvcfs/work/{sample}.g.vcf.idx",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/normalize_external_gvcf_for_gatk_long/{sample}.txt"
+shell = """
+# GATK reads the plain work VCF (its .idx is GATK-written by
+# IndexFeatureFile); the .gz + CSI pair is the durable deliverable. Upstream
+# keeps the external work file under results/gvcfs/work/external/ and
+# archives nothing for gVCF samples; the port shares the work path with the
+# regular samples (input_type is single-valued per sample, so the paths are
+# disjoint by sample) and adds the archive to keep the port's gVCF
+# deliverable complete (deviation: see README).
+bcftools view -O v -o {output[0]} {input[0]} 2> {log}
+gatk IndexFeatureFile -I {output[0]} 2>> {log}
+bcftools view -O z -o {output[2]} {input[0]} 2>> {log}
+bcftools index -f -c {output[2]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.environment]
+conda = "envs/gatk.yaml"
 
 # ---------------------------------------------------------------------------
 # Interval scatter (GATK, gated by intervals_enabled)
@@ -627,6 +893,11 @@ output = [
 ]
 log = "logs/gatk_haplotypecaller_interval/{sample}/{interval}.txt"
 shell = """
+# Upstream HC_MIN_PRUNING/HC_MIN_DANGLING (v2.3.0): low-coverage cohorts call
+# at 1/1, otherwise GATK's defaults 2/4.
+HC_PRUNE=1
+HC_DANGLING=1
+if [ "{config.expected_coverage}" != "low" ]; then HC_PRUNE=2; HC_DANGLING=4; fi
 gatk HaplotypeCaller \
     --java-options '-Xmx7000m' \
     -R {input[2]} \
@@ -637,8 +908,8 @@ gatk HaplotypeCaller \
     -ploidy {config.ploidy} \
     --native-pair-hmm-threads {threads} \
     --emit-ref-confidence GVCF \
-    --min-pruning 1 \
-    --min-dangling-branch-length 1
+    --min-pruning "$HC_PRUNE" \
+    --min-dangling-branch-length "$HC_DANGLING"
 """
 tags = ["variant-calling"]
 
@@ -666,6 +937,11 @@ output = [
 depends_on = ["resolve_long_contig_mode"]
 log = "logs/gatk_haplotypecaller_interval_long/{sample}/{interval}.txt"
 shell = """
+# Upstream HC_MIN_PRUNING/HC_MIN_DANGLING (v2.3.0): low-coverage cohorts call
+# at 1/1, otherwise GATK's defaults 2/4.
+HC_PRUNE=1
+HC_DANGLING=1
+if [ "{config.expected_coverage}" != "low" ]; then HC_PRUNE=2; HC_DANGLING=4; fi
 gatk HaplotypeCaller \
     --java-options '-Xmx7000m' \
     -R {input[2]} \
@@ -676,8 +952,8 @@ gatk HaplotypeCaller \
     -ploidy {config.ploidy} \
     --native-pair-hmm-threads {threads} \
     --emit-ref-confidence GVCF \
-    --min-pruning 1 \
-    --min-dangling-branch-length 1
+    --min-pruning "$HC_PRUNE" \
+    --min-dangling-branch-length "$HC_DANGLING"
 """
 tags = ["variant-calling"]
 
@@ -705,6 +981,11 @@ output = [
 ]
 log = "logs/gatk_haplotypecaller_interval_markdup/{sample}/{interval}.txt"
 shell = """
+# Upstream HC_MIN_PRUNING/HC_MIN_DANGLING (v2.3.0): low-coverage cohorts call
+# at 1/1, otherwise GATK's defaults 2/4.
+HC_PRUNE=1
+HC_DANGLING=1
+if [ "{config.expected_coverage}" != "low" ]; then HC_PRUNE=2; HC_DANGLING=4; fi
 gatk HaplotypeCaller \
     --java-options '-Xmx7000m' \
     -R {input[2]} \
@@ -715,8 +996,8 @@ gatk HaplotypeCaller \
     -ploidy {config.ploidy} \
     --native-pair-hmm-threads {threads} \
     --emit-ref-confidence GVCF \
-    --min-pruning 1 \
-    --min-dangling-branch-length 1
+    --min-pruning "$HC_PRUNE" \
+    --min-dangling-branch-length "$HC_DANGLING"
 """
 tags = ["variant-calling"]
 
@@ -744,6 +1025,11 @@ output = [
 depends_on = ["resolve_long_contig_mode"]
 log = "logs/gatk_haplotypecaller_interval_markdup_long/{sample}/{interval}.txt"
 shell = """
+# Upstream HC_MIN_PRUNING/HC_MIN_DANGLING (v2.3.0): low-coverage cohorts call
+# at 1/1, otherwise GATK's defaults 2/4.
+HC_PRUNE=1
+HC_DANGLING=1
+if [ "{config.expected_coverage}" != "low" ]; then HC_PRUNE=2; HC_DANGLING=4; fi
 gatk HaplotypeCaller \
     --java-options '-Xmx7000m' \
     -R {input[2]} \
@@ -754,8 +1040,8 @@ gatk HaplotypeCaller \
     -ploidy {config.ploidy} \
     --native-pair-hmm-threads {threads} \
     --emit-ref-confidence GVCF \
-    --min-pruning 1 \
-    --min-dangling-branch-length 1
+    --min-pruning "$HC_PRUNE" \
+    --min-dangling-branch-length "$HC_DANGLING"
 """
 tags = ["variant-calling"]
 
@@ -783,6 +1069,11 @@ output = [
 ]
 log = "logs/gatk_haplotypecaller_interval_external/{sample}/{interval}.txt"
 shell = """
+# Upstream HC_MIN_PRUNING/HC_MIN_DANGLING (v2.3.0): low-coverage cohorts call
+# at 1/1, otherwise GATK's defaults 2/4.
+HC_PRUNE=1
+HC_DANGLING=1
+if [ "{config.expected_coverage}" != "low" ]; then HC_PRUNE=2; HC_DANGLING=4; fi
 gatk HaplotypeCaller \
     --java-options '-Xmx7000m' \
     -R {input[2]} \
@@ -793,8 +1084,8 @@ gatk HaplotypeCaller \
     -ploidy {config.ploidy} \
     --native-pair-hmm-threads {threads} \
     --emit-ref-confidence GVCF \
-    --min-pruning 1 \
-    --min-dangling-branch-length 1
+    --min-pruning "$HC_PRUNE" \
+    --min-dangling-branch-length "$HC_DANGLING"
 """
 tags = ["variant-calling"]
 
@@ -822,6 +1113,11 @@ output = [
 depends_on = ["resolve_long_contig_mode"]
 log = "logs/gatk_haplotypecaller_interval_external_long/{sample}/{interval}.txt"
 shell = """
+# Upstream HC_MIN_PRUNING/HC_MIN_DANGLING (v2.3.0): low-coverage cohorts call
+# at 1/1, otherwise GATK's defaults 2/4.
+HC_PRUNE=1
+HC_DANGLING=1
+if [ "{config.expected_coverage}" != "low" ]; then HC_PRUNE=2; HC_DANGLING=4; fi
 gatk HaplotypeCaller \
     --java-options '-Xmx7000m' \
     -R {input[2]} \
@@ -832,8 +1128,8 @@ gatk HaplotypeCaller \
     -ploidy {config.ploidy} \
     --native-pair-hmm-threads {threads} \
     --emit-ref-confidence GVCF \
-    --min-pruning 1 \
-    --min-dangling-branch-length 1
+    --min-pruning "$HC_PRUNE" \
+    --min-dangling-branch-length "$HC_DANGLING"
 """
 tags = ["variant-calling"]
 
@@ -1002,6 +1298,9 @@ input = [
 ]
 expand_inputs = [
     { pattern = "results/gvcfs/work/{sample}.g.vcf", variables = { sample = "config.samples_list" } },
+    { pattern = "results/gvcfs/work/{sample}.g.vcf.idx", variables = { sample = "config.samples_list" } },
+    { pattern = "results/gvcfs/{sample}.g.vcf.gz", variables = { sample = "config.samples_list" } },
+    { pattern = "results/gvcfs/{sample}.g.vcf.gz.csi", variables = { sample = "config.samples_list" } },
 ]
 when = "config.intervals_enabled && config.joint_genotyping_enabled && config.variant_tool == 'gatk' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
 output = [
@@ -1141,8 +1440,50 @@ conda = "envs/bcftools.yaml"
 
 [[rules]]
 name = "concat_interval_vcfs_long"
-description = "Concatenate per-shard raw VCFs into the joint raw VCF (interval mode, long-contig CSI; upstream compress_interval_raw_vcf parity)"
+description = "Concatenate per-shard raw VCFs into the joint work VCF (interval mode, long-contig CSI; upstream gatk_genotype long chain — plain work/raw.vcf + .idx, compressed by compress_interval_raw_vcf)"
 input = ["results/vcfs/intervals/*.vcf"]
+when = "config.intervals_enabled && config.joint_genotyping_enabled && config.variant_tool == 'gatk' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/vcfs/work/raw.vcf",
+    "results/vcfs/work/raw.vcf.idx",
+]
+temp_output = [
+    "results/vcfs/work/raw.vcf",
+    "results/vcfs/work/raw.vcf.idx",
+]
+depends_on = ["create_db_intervals", "resolve_long_contig_mode"]
+log = "logs/concat_interval_vcfs_long.txt"
+shell = """
+# GATK cannot read a CSI-only bgzip VCF, so the long-mode gather keeps the
+# call set as a plain work VCF with a GATK .idx (upstream RAW_VCF_WORK);
+# compress_interval_raw_vcf produces the .gz + CSI pair. Upstream stages with
+# batched picard SortVcf (heap-capped MAX_RECORDS_IN_RAM); the port gathers in
+# one bcftools pass (deviation: see README).
+mkdir -p results/vcfs/work
+for vcf in {input}; do
+    bgzip -c "$vcf" > "results/vcfs/work/shard.$(basename "$vcf").gz"
+    bcftools index -f "results/vcfs/work/shard.$(basename "$vcf").gz"
+done
+bcftools concat -D -a -Ou results/vcfs/work/shard.*.vcf.gz 2> {log} \
+    | bcftools sort -T . -O v -o {output[0]} 2>> {log}
+rm -f results/vcfs/work/shard.*.vcf.gz*
+gatk IndexFeatureFile -I {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "compress_interval_raw_vcf"
+description = "Compress and CSI-index the interval-mode long-contig work VCF into the joint raw VCF (upstream compress_interval_raw_vcf)"
+input = [
+    "results/vcfs/work/raw.vcf",
+    "results/vcfs/work/raw.vcf.idx",
+]
 when = "config.intervals_enabled && config.joint_genotyping_enabled && config.variant_tool == 'gatk' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
 output = [
     "results/vcfs/raw.vcf.gz",
@@ -1152,17 +1493,11 @@ temp_output = [
     "results/vcfs/raw.vcf.gz",
     "results/vcfs/raw.vcf.gz.csi",
 ]
-depends_on = ["create_db_intervals", "resolve_long_contig_mode"]
-log = "logs/concat_interval_vcfs_long.txt"
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/compress_interval_raw_vcf.txt"
 shell = """
-mkdir -p results/vcfs/work
-for vcf in {input}; do
-    bgzip -c "$vcf" > "results/vcfs/work/$(basename "$vcf").gz"
-    bcftools index -f "results/vcfs/work/$(basename "$vcf").gz"
-done
-bcftools concat -D -a -Ou results/vcfs/work/*.vcf.gz 2> {log} \
-    | bcftools sort -T . -Oz -o {output[0]} 2>> {log}
-bcftools index -c {output[0]} 2>> {log}
+bcftools view -Oz -o {output[0]} {input[0]} 2> {log}
+bcftools index -f -c {output[0]} 2>> {log}
 """
 tags = ["variant-calling"]
 
@@ -1186,13 +1521,18 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
-when = "config.variant_tool == 'gatk' && (!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && !config.intervals_enabled && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "config.variant_tool == 'gatk' && (!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && !config.intervals_enabled && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr') && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/gvcfs/{sample}.g.vcf.gz",
     "results/gvcfs/{sample}.g.vcf.gz.tbi",
 ]
 log = "logs/gatk_haplotypecaller/{sample}.txt"
 shell = """
+# Upstream HC_MIN_PRUNING/HC_MIN_DANGLING (v2.3.0): low-coverage cohorts call
+# at 1/1, otherwise GATK's defaults 2/4.
+HC_PRUNE=1
+HC_DANGLING=1
+if [ "{config.expected_coverage}" != "low" ]; then HC_PRUNE=2; HC_DANGLING=4; fi
 gatk HaplotypeCaller \
     --java-options '-Xmx7000m' \
     -R {input[2]} \
@@ -1202,8 +1542,8 @@ gatk HaplotypeCaller \
     -ploidy {config.ploidy} \
     --native-pair-hmm-threads {threads} \
     --emit-ref-confidence GVCF \
-    --min-pruning 1 \
-    --min-dangling-branch-length 1
+    --min-pruning "$HC_PRUNE" \
+    --min-dangling-branch-length "$HC_DANGLING"
 """
 tags = ["variant-calling"]
 
@@ -1223,13 +1563,18 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
-when = "config.variant_tool == 'gatk' && (config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && !config.intervals_enabled && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "config.variant_tool == 'gatk' && (config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && !config.intervals_enabled && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr') && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/gvcfs/{sample}.g.vcf.gz",
     "results/gvcfs/{sample}.g.vcf.gz.tbi",
 ]
 log = "logs/gatk_haplotypecaller_markdup/{sample}.txt"
 shell = """
+# Upstream HC_MIN_PRUNING/HC_MIN_DANGLING (v2.3.0): low-coverage cohorts call
+# at 1/1, otherwise GATK's defaults 2/4.
+HC_PRUNE=1
+HC_DANGLING=1
+if [ "{config.expected_coverage}" != "low" ]; then HC_PRUNE=2; HC_DANGLING=4; fi
 gatk HaplotypeCaller \
     --java-options '-Xmx7000m' \
     -R {input[2]} \
@@ -1239,8 +1584,8 @@ gatk HaplotypeCaller \
     -ploidy {config.ploidy} \
     --native-pair-hmm-threads {threads} \
     --emit-ref-confidence GVCF \
-    --min-pruning 1 \
-    --min-dangling-branch-length 1
+    --min-pruning "$HC_PRUNE" \
+    --min-dangling-branch-length "$HC_DANGLING"
 """
 tags = ["variant-calling"]
 
@@ -1267,6 +1612,11 @@ output = [
 ]
 log = "logs/gatk_haplotypecaller_external/{sample}.txt"
 shell = """
+# Upstream HC_MIN_PRUNING/HC_MIN_DANGLING (v2.3.0): low-coverage cohorts call
+# at 1/1, otherwise GATK's defaults 2/4.
+HC_PRUNE=1
+HC_DANGLING=1
+if [ "{config.expected_coverage}" != "low" ]; then HC_PRUNE=2; HC_DANGLING=4; fi
 gatk HaplotypeCaller \
     --java-options '-Xmx7000m' \
     -R {input[2]} \
@@ -1276,8 +1626,8 @@ gatk HaplotypeCaller \
     -ploidy {config.ploidy} \
     --native-pair-hmm-threads {threads} \
     --emit-ref-confidence GVCF \
-    --min-pruning 1 \
-    --min-dangling-branch-length 1
+    --min-pruning "$HC_PRUNE" \
+    --min-dangling-branch-length "$HC_DANGLING"
 """
 tags = ["variant-calling"]
 
@@ -1286,6 +1636,218 @@ threads = 1
 
 [rules.environment]
 conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "gatk_haplotypecaller_long"
+description = "Per-sample variant calling to a plain work gVCF with GATK HaplotypeCaller (long-contig CSI; no-markdup BAM)"
+input = [
+    "results/bams/merged/{sample}.bam",
+    "results/bams/merged/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.variant_tool == 'gatk' && (!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && !config.intervals_enabled && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr') && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/gvcfs/work/{sample}.g.vcf",
+    "results/gvcfs/work/{sample}.g.vcf.idx",
+]
+temp_output = [
+    "results/gvcfs/work/{sample}.g.vcf",
+    "results/gvcfs/work/{sample}.g.vcf.idx",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/gatk_haplotypecaller_long/{sample}.txt"
+shell = """
+HC_PRUNE=1
+HC_DANGLING=1
+if [ "{config.expected_coverage}" != "low" ]; then HC_PRUNE=2; HC_DANGLING=4; fi
+mkdir -p results/gvcfs/work
+gatk HaplotypeCaller \
+    --java-options '-Xmx7000m' \
+    -R {input[2]} \
+    -I {input[0]} \
+    --read-index {input[1]} \
+    -O {output[0]} \
+    -ploidy {config.ploidy} \
+    --native-pair-hmm-threads {threads} \
+    --emit-ref-confidence GVCF \
+    --min-pruning "$HC_PRUNE" \
+    --min-dangling-branch-length "$HC_DANGLING"
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "gatk_haplotypecaller_markdup_long"
+description = "Per-sample variant calling to a plain work gVCF with GATK HaplotypeCaller (long-contig CSI; duplicate-marked BAM)"
+input = [
+    "results/bams/markdup/{sample}.bam",
+    "results/bams/markdup/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.variant_tool == 'gatk' && (config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && !config.intervals_enabled && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr') && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/gvcfs/work/{sample}.g.vcf",
+    "results/gvcfs/work/{sample}.g.vcf.idx",
+]
+temp_output = [
+    "results/gvcfs/work/{sample}.g.vcf",
+    "results/gvcfs/work/{sample}.g.vcf.idx",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/gatk_haplotypecaller_markdup_long/{sample}.txt"
+shell = """
+HC_PRUNE=1
+HC_DANGLING=1
+if [ "{config.expected_coverage}" != "low" ]; then HC_PRUNE=2; HC_DANGLING=4; fi
+mkdir -p results/gvcfs/work
+gatk HaplotypeCaller \
+    --java-options '-Xmx7000m' \
+    -R {input[2]} \
+    -I {input[0]} \
+    --read-index {input[1]} \
+    -O {output[0]} \
+    -ploidy {config.ploidy} \
+    --native-pair-hmm-threads {threads} \
+    --emit-ref-confidence GVCF \
+    --min-pruning "$HC_PRUNE" \
+    --min-dangling-branch-length "$HC_DANGLING"
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "gatk_haplotypecaller_external_long"
+description = "Per-sample variant calling to a plain work gVCF with GATK HaplotypeCaller (long-contig CSI; staged external BAM)"
+input = [
+    "results/bams/input/{sample}.bam",
+    "results/bams/input/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.variant_tool == 'gatk' && !config.intervals_enabled && wildcard.input_type == 'bam' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/gvcfs/work/{sample}.g.vcf",
+    "results/gvcfs/work/{sample}.g.vcf.idx",
+]
+temp_output = [
+    "results/gvcfs/work/{sample}.g.vcf",
+    "results/gvcfs/work/{sample}.g.vcf.idx",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/gatk_haplotypecaller_external_long/{sample}.txt"
+shell = """
+HC_PRUNE=1
+HC_DANGLING=1
+if [ "{config.expected_coverage}" != "low" ]; then HC_PRUNE=2; HC_DANGLING=4; fi
+mkdir -p results/gvcfs/work
+gatk HaplotypeCaller \
+    --java-options '-Xmx7000m' \
+    -R {input[2]} \
+    -I {input[0]} \
+    --read-index {input[1]} \
+    -O {output[0]} \
+    -ploidy {config.ploidy} \
+    --native-pair-hmm-threads {threads} \
+    --emit-ref-confidence GVCF \
+    --min-pruning "$HC_PRUNE" \
+    --min-dangling-branch-length "$HC_DANGLING"
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+# Upstream archive_gatk_gvcf (gatk_gvcf.smk): compresses the long-mode work
+# gVCF into the durable .gz + CSI deliverable. One rule per input family
+# (the port has no per-sample lambda); each mirrors its HaplotypeCaller
+# twin's gate minus !intervals, so it also archives the interval-mode
+# concat output.
+[[rules]]
+name = "archive_gatk_gvcf"
+description = "Compress and CSI-index the long-contig work gVCF into the durable gVCF deliverable (no-markdup BAM)"
+input = [
+    "results/gvcfs/work/{sample}.g.vcf",
+    "results/gvcfs/work/{sample}.g.vcf.idx",
+]
+when = "config.variant_tool == 'gatk' && (!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr') && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/gvcfs/{sample}.g.vcf.gz",
+    "results/gvcfs/{sample}.g.vcf.gz.csi",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/archive_gatk_gvcf/{sample}.txt"
+shell = """
+bcftools view -Oz -o {output[0]} {input[0]} 2> {log}
+bcftools index -f -c {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.environment]
+conda = "envs/bcftools.yaml"
+
+[[rules]]
+name = "archive_gatk_gvcf_markdup"
+description = "Compress and CSI-index the long-contig work gVCF into the durable gVCF deliverable (duplicate-marked BAM)"
+input = [
+    "results/gvcfs/work/{sample}.g.vcf",
+    "results/gvcfs/work/{sample}.g.vcf.idx",
+]
+when = "config.variant_tool == 'gatk' && (config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr') && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/gvcfs/{sample}.g.vcf.gz",
+    "results/gvcfs/{sample}.g.vcf.gz.csi",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/archive_gatk_gvcf_markdup/{sample}.txt"
+shell = """
+bcftools view -Oz -o {output[0]} {input[0]} 2> {log}
+bcftools index -f -c {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.environment]
+conda = "envs/bcftools.yaml"
+
+[[rules]]
+name = "archive_gatk_gvcf_external"
+description = "Compress and CSI-index the long-contig work gVCF into the durable gVCF deliverable (staged external BAM)"
+input = [
+    "results/gvcfs/work/{sample}.g.vcf",
+    "results/gvcfs/work/{sample}.g.vcf.idx",
+]
+when = "config.variant_tool == 'gatk' && wildcard.input_type == 'bam' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/gvcfs/{sample}.g.vcf.gz",
+    "results/gvcfs/{sample}.g.vcf.gz.csi",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/archive_gatk_gvcf_external/{sample}.txt"
+shell = """
+bcftools view -Oz -o {output[0]} {input[0]} 2> {log}
+bcftools index -f -c {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.environment]
+conda = "envs/bcftools.yaml"
 
 [[rules]]
 name = "deepvariant_call"
@@ -1297,7 +1859,7 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
-when = "config.variant_tool == 'deepvariant' && (!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "config.variant_tool == 'deepvariant' && (!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr') && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/gvcfs/{sample}.g.vcf.gz",
     "results/gvcfs/{sample}.g.vcf.gz.tbi",
@@ -1310,15 +1872,23 @@ temp_output = [
 ]
 log = "logs/deepvariant_call/{sample}.txt"
 shell = """
-mkdir -p results/deepvariant/{sample}
+# Intermediate tfrecords can take tens of GB per sample. Keep them in a
+# private directory under the working directory (which the container runtime
+# binds; a custom tmpdir may not be), and remove it when the job ends
+# (v2.3.0 WORK-dir fix).
+WORK=$(mktemp -d "results/deepvariant/{sample}.XXXXXX")
+trap 'rm -rf "$WORK";' EXIT
+# --sample_name overrides the BAM's read-group SM, which GLnexus would
+# otherwise use for the sample's column (v2.3.0).
 /opt/deepvariant/bin/run_deepvariant \
     --ref {input[2]} \
     --reads {input[0]} \
+    --sample_name {sample} \
     --output_vcf {output[2]} \
     --output_gvcf {output[0]} \
     --model_type {config.deepvariant_model_type} \
     --num_shards {threads} \
-    --intermediate_results_dir results/deepvariant/{sample} \
+    --intermediate_results_dir "$WORK" \
     &> {log}
 """
 tags = ["variant-calling"]
@@ -1339,7 +1909,7 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
-when = "config.variant_tool == 'deepvariant' && (config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr')"
+when = "config.variant_tool == 'deepvariant' && (config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr') && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/gvcfs/{sample}.g.vcf.gz",
     "results/gvcfs/{sample}.g.vcf.gz.tbi",
@@ -1352,15 +1922,23 @@ temp_output = [
 ]
 log = "logs/deepvariant_call_markdup/{sample}.txt"
 shell = """
-mkdir -p results/deepvariant/{sample}
+# Intermediate tfrecords can take tens of GB per sample. Keep them in a
+# private directory under the working directory (which the container runtime
+# binds; a custom tmpdir may not be), and remove it when the job ends
+# (v2.3.0 WORK-dir fix).
+WORK=$(mktemp -d "results/deepvariant/{sample}.XXXXXX")
+trap 'rm -rf "$WORK";' EXIT
+# --sample_name overrides the BAM's read-group SM, which GLnexus would
+# otherwise use for the sample's column (v2.3.0).
 /opt/deepvariant/bin/run_deepvariant \
     --ref {input[2]} \
     --reads {input[0]} \
+    --sample_name {sample} \
     --output_vcf {output[2]} \
     --output_gvcf {output[0]} \
     --model_type {config.deepvariant_model_type} \
     --num_shards {threads} \
-    --intermediate_results_dir results/deepvariant/{sample} \
+    --intermediate_results_dir "$WORK" \
     &> {log}
 """
 tags = ["variant-calling"]
@@ -1381,7 +1959,7 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
-when = "config.variant_tool == 'deepvariant' && wildcard.input_type == 'bam'"
+when = "config.variant_tool == 'deepvariant' && wildcard.input_type == 'bam' && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/gvcfs/{sample}.g.vcf.gz",
     "results/gvcfs/{sample}.g.vcf.gz.tbi",
@@ -1394,15 +1972,23 @@ temp_output = [
 ]
 log = "logs/deepvariant_call_external/{sample}.txt"
 shell = """
-mkdir -p results/deepvariant/{sample}
+# Intermediate tfrecords can take tens of GB per sample. Keep them in a
+# private directory under the working directory (which the container runtime
+# binds; a custom tmpdir may not be), and remove it when the job ends
+# (v2.3.0 WORK-dir fix).
+WORK=$(mktemp -d "results/deepvariant/{sample}.XXXXXX")
+trap 'rm -rf "$WORK";' EXIT
+# --sample_name overrides the BAM's read-group SM, which GLnexus would
+# otherwise use for the sample's column (v2.3.0).
 /opt/deepvariant/bin/run_deepvariant \
     --ref {input[2]} \
     --reads {input[0]} \
+    --sample_name {sample} \
     --output_vcf {output[2]} \
     --output_gvcf {output[0]} \
     --model_type {config.deepvariant_model_type} \
     --num_shards {threads} \
-    --intermediate_results_dir results/deepvariant/{sample} \
+    --intermediate_results_dir "$WORK" \
     &> {log}
 """
 tags = ["variant-calling"]
@@ -1412,6 +1998,161 @@ threads = 8
 
 [rules.environment]
 docker = "google/deepvariant:1.10.0"
+
+# ---------------------------------------------------------------------------
+# DeepVariant long-contig (CSI) chain: run_deepvariant writes uncompressed
+# files, and archive_deepvariant_gvcf compresses the gVCF with a CSI index
+# (upstream DEEPVARIANT_CALL_OUTPUT / archive rule in deepvariant.smk).
+# ---------------------------------------------------------------------------
+
+[[rules]]
+name = "deepvariant_call_long"
+description = "Per-sample variant calling with DeepVariant (long-contig CSI; uncompressed temp outputs, archived by archive_deepvariant_gvcf)"
+input = [
+    "results/bams/merged/{sample}.bam",
+    "results/bams/merged/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.variant_tool == 'deepvariant' && (!config.mark_duplicates || {meta.mark_duplicates} == 'false') && {meta.mark_duplicates} != 'true' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr') && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/deepvariant/{sample}.g.vcf",
+    "results/deepvariant/{sample}.vcf",
+]
+temp_output = [
+    "results/deepvariant/{sample}.g.vcf",
+    "results/deepvariant/{sample}.vcf",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/deepvariant_call_long/{sample}.txt"
+shell = """
+WORK=$(mktemp -d "results/deepvariant/{sample}.XXXXXX")
+trap 'rm -rf "$WORK";' EXIT
+/opt/deepvariant/bin/run_deepvariant \
+    --ref {input[2]} \
+    --reads {input[0]} \
+    --sample_name {sample} \
+    --output_vcf {output[1]} \
+    --output_gvcf {output[0]} \
+    --model_type {config.deepvariant_model_type} \
+    --num_shards {threads} \
+    --intermediate_results_dir "$WORK" \
+    &> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 8
+
+[rules.environment]
+docker = "google/deepvariant:1.10.0"
+
+[[rules]]
+name = "deepvariant_call_markdup_long"
+description = "Per-sample variant calling with DeepVariant (long-contig CSI; duplicate-marked BAM)"
+input = [
+    "results/bams/markdup/{sample}.bam",
+    "results/bams/markdup/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.variant_tool == 'deepvariant' && (config.mark_duplicates || {meta.mark_duplicates} == 'true') && {meta.mark_duplicates} != 'false' && (wildcard.input_type == 'fastq' || wildcard.input_type == 'srr') && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/deepvariant/{sample}.g.vcf",
+    "results/deepvariant/{sample}.vcf",
+]
+temp_output = [
+    "results/deepvariant/{sample}.g.vcf",
+    "results/deepvariant/{sample}.vcf",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/deepvariant_call_markdup_long/{sample}.txt"
+shell = """
+WORK=$(mktemp -d "results/deepvariant/{sample}.XXXXXX")
+trap 'rm -rf "$WORK";' EXIT
+/opt/deepvariant/bin/run_deepvariant \
+    --ref {input[2]} \
+    --reads {input[0]} \
+    --sample_name {sample} \
+    --output_vcf {output[1]} \
+    --output_gvcf {output[0]} \
+    --model_type {config.deepvariant_model_type} \
+    --num_shards {threads} \
+    --intermediate_results_dir "$WORK" \
+    &> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 8
+
+[rules.environment]
+docker = "google/deepvariant:1.10.0"
+
+[[rules]]
+name = "deepvariant_call_external_long"
+description = "Per-sample variant calling with DeepVariant (long-contig CSI; staged external BAM)"
+input = [
+    "results/bams/input/{sample}.bam",
+    "results/bams/input/{sample}.bam.csi",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.variant_tool == 'deepvariant' && wildcard.input_type == 'bam' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/deepvariant/{sample}.g.vcf",
+    "results/deepvariant/{sample}.vcf",
+]
+temp_output = [
+    "results/deepvariant/{sample}.g.vcf",
+    "results/deepvariant/{sample}.vcf",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/deepvariant_call_external_long/{sample}.txt"
+shell = """
+WORK=$(mktemp -d "results/deepvariant/{sample}.XXXXXX")
+trap 'rm -rf "$WORK";' EXIT
+/opt/deepvariant/bin/run_deepvariant \
+    --ref {input[2]} \
+    --reads {input[0]} \
+    --sample_name {sample} \
+    --output_vcf {output[1]} \
+    --output_gvcf {output[0]} \
+    --model_type {config.deepvariant_model_type} \
+    --num_shards {threads} \
+    --intermediate_results_dir "$WORK" \
+    &> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 8
+
+[rules.environment]
+docker = "google/deepvariant:1.10.0"
+
+[[rules]]
+name = "archive_deepvariant_gvcf"
+description = "Compress and CSI-index the uncompressed long-contig DeepVariant gVCF into the durable gVCF deliverable"
+input = ["results/deepvariant/{sample}.g.vcf"]
+when = "config.variant_tool == 'deepvariant' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/gvcfs/{sample}.g.vcf.gz",
+    "results/gvcfs/{sample}.g.vcf.gz.csi",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/archive_deepvariant_gvcf/{sample}.txt"
+shell = """
+bcftools view -Oz -o {output[0]} {input[0]} 2> {log}
+bcftools index -f -c {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.environment]
+conda = "envs/bcftools.yaml"
 
 # ---------------------------------------------------------------------------
 # Joint genotyping (GATK: GenomicsDB -> GenotypeGVCFs; DeepVariant: GLnexus)
@@ -1436,6 +2177,8 @@ description = "Write the GenomicsDB sample-name map from per-sample gVCFs (long-
 input = []
 expand_inputs = [
     { pattern = "results/gvcfs/work/{sample}.g.vcf", variables = { sample = "config.samples_list" } },
+    { pattern = "results/gvcfs/{sample}.g.vcf.gz", variables = { sample = "config.samples_list" } },
+    { pattern = "results/gvcfs/{sample}.g.vcf.gz.csi", variables = { sample = "config.samples_list" } },
 ]
 when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
 output = ["results/genomics_db/mapfile.txt"]
@@ -1457,7 +2200,7 @@ expand_inputs = [
     { pattern = "results/gvcfs/{sample}.g.vcf.gz", variables = { sample = "config.samples_list" } },
     { pattern = "results/gvcfs/{sample}.g.vcf.gz.tbi", variables = { sample = "config.samples_list" } },
 ]
-when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk' && !config.intervals_enabled"
+when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk' && !config.intervals_enabled && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/gatk_genomics_db",
     "results/gatk_genomics_db.tar",
@@ -1468,12 +2211,17 @@ shell = """
 : > {log}
 export TILEDB_DISABLE_FILE_LOCKING=1
 # Upstream passes the .fai as -L, which GATK 4.x rejects ("does not
-# contain Features"). Translate the intent — import every reference
-# contig — into a bare contig-name list, which GATK accepts natively.
-cut -f1 {input[2]} > results/reference/contigs.list
+# contain Features"). v2.3.0 sends one whole-contig interval per contig as
+# BED: GATK's -L reads interval files (.list, .intervals, .interval_list,
+# .bed) and rejects a .fai, and BED, unlike a .list of names, cannot mistake
+# a contig name containing ':' for chr:start-end. Whole contigs are also what
+# --merge-contigs-into-num-partitions requires.
 MERGE_CONTIGS_ARG=$(python scripts/interval_list_tools.py genomicsdb-merge-contigs-arg \\
     --input {input[2]} \\
     --threshold 50 2>> {log})
+WORK=$(mktemp -d "results/gatk_genomics_db_import_work_XXXXXX")
+trap 'rm -rf "$WORK";' EXIT
+awk 'BEGIN {OFS = "\\t"} {print $1, 0, $2}' {input[2]} > "$WORK/whole_genome.bed"
 gatk GenomicsDBImport \
     --java-options '-Xmx7000m' \
     --genomicsdb-shared-posixfs-optimizations true \
@@ -1481,7 +2229,59 @@ gatk GenomicsDBImport \
     --genomicsdb-workspace-path {output[0]} \
     --merge-input-intervals $MERGE_CONTIGS_ARG \
     --reader-threads {threads} \
-    -L results/reference/contigs.list \
+    -L "$WORK/whole_genome.bed" \
+    --sample-name-map {input[0]} \
+    >> {log} 2>&1
+tar -cf {output[1]} {output[0]} >> {log} 2>&1
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "joint_genomics_db_import_long"
+description = "Import all sample gVCFs into a GenomicsDB workspace (long-contig CSI; GATK reads the plain work .vcf + .idx, archives ordered in as inputs)"
+input = [
+    "results/genomics_db/mapfile.txt",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+expand_inputs = [
+    { pattern = "results/gvcfs/work/{sample}.g.vcf", variables = { sample = "config.samples_list" } },
+    { pattern = "results/gvcfs/work/{sample}.g.vcf.idx", variables = { sample = "config.samples_list" } },
+    { pattern = "results/gvcfs/{sample}.g.vcf.gz", variables = { sample = "config.samples_list" } },
+    { pattern = "results/gvcfs/{sample}.g.vcf.gz.csi", variables = { sample = "config.samples_list" } },
+]
+when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk' && !config.intervals_enabled && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/gatk_genomics_db",
+    "results/gatk_genomics_db.tar",
+]
+temp_output = ["results/gatk_genomics_db"]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/joint_genomics_db_import_long.txt"
+shell = """
+: > {log}
+export TILEDB_DISABLE_FILE_LOCKING=1
+MERGE_CONTIGS_ARG=$(python scripts/interval_list_tools.py genomicsdb-merge-contigs-arg \\
+    --input {input[2]} \\
+    --threshold 50 2>> {log})
+WORK=$(mktemp -d "results/gatk_genomics_db_import_work_XXXXXX")
+trap 'rm -rf "$WORK";' EXIT
+awk 'BEGIN {OFS = "\\t"} {print $1, 0, $2}' {input[2]} > "$WORK/whole_genome.bed"
+gatk GenomicsDBImport \
+    --java-options '-Xmx7000m' \
+    --genomicsdb-shared-posixfs-optimizations true \
+    --batch-size 25 \
+    --genomicsdb-workspace-path {output[0]} \
+    --merge-input-intervals $MERGE_CONTIGS_ARG \
+    --reader-threads {threads} \
+    -L "$WORK/whole_genome.bed" \
     --sample-name-map {input[0]} \
     >> {log} 2>&1
 tar -cf {output[1]} {output[0]} >> {log} 2>&1
@@ -1503,7 +2303,7 @@ input = [
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
-when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk' && !config.intervals_enabled"
+when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk' && !config.intervals_enabled && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/vcfs/raw.vcf.gz",
     "results/vcfs/raw.vcf.gz.tbi",
@@ -1535,6 +2335,78 @@ threads = 1
 conda = "envs/gatk.yaml"
 
 [[rules]]
+name = "joint_genotype_gvcfs_long"
+description = "Jointly genotype the cohort from the GenomicsDB workspace (long-contig CSI; plain work/raw.vcf + .idx, compressed by compress_joint_raw_vcf)"
+input = [
+    "results/gatk_genomics_db.tar",
+    "results/reference/{config.reference_name}.fa.gz",
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/reference/{config.reference_name}.dict",
+]
+when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk' && !config.intervals_enabled && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/vcfs/work/raw.vcf",
+    "results/vcfs/work/raw.vcf.idx",
+]
+temp_output = [
+    "results/vcfs/work/raw.vcf",
+    "results/vcfs/work/raw.vcf.idx",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/joint_genotype_gvcfs_long.txt"
+shell = """
+mkdir -p results/vcfs/work
+EXTRACT_DIR=$(mktemp -d .oxo-joint-gvcf.XXXXXX)
+trap 'rm -rf "$EXTRACT_DIR";' EXIT
+tar -xf {input[0]} -C "$EXTRACT_DIR"
+gatk GenotypeGVCFs \
+    --java-options '-Xmx7000m' \
+    -R {input[1]} \
+    --heterozygosity {config.gatk_het_prior} \
+    --genomicsdb-shared-posixfs-optimizations true \
+    -V gendb://"$EXTRACT_DIR/results/gatk_genomics_db" \
+    -O {output[0]} \
+    &> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "compress_joint_raw_vcf"
+description = "Compress and CSI-index the long-contig joint work VCF into the joint raw VCF (upstream compress_joint_raw_vcf)"
+input = [
+    "results/vcfs/work/raw.vcf",
+    "results/vcfs/work/raw.vcf.idx",
+]
+when = "config.joint_genotyping_enabled && config.variant_tool == 'gatk' && !config.intervals_enabled && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.csi",
+]
+temp_output = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.csi",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/compress_joint_raw_vcf.txt"
+shell = """
+bcftools view -Oz -o {output[0]} {input[0]} 2> {log}
+bcftools index -f -c {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/bcftools.yaml"
+
+[[rules]]
 name = "glnexus_joint"
 description = "Jointly genotype DeepVariant gVCFs with GLnexus (DeepVariant branch)"
 input = []
@@ -1542,7 +2414,7 @@ expand_inputs = [
     { pattern = "results/gvcfs/{sample}.g.vcf.gz", variables = { sample = "config.samples_list" } },
     { pattern = "results/gvcfs/{sample}.g.vcf.gz.tbi", variables = { sample = "config.samples_list" } },
 ]
-when = "config.joint_genotyping_enabled && config.variant_tool == 'deepvariant'"
+when = "config.joint_genotyping_enabled && config.variant_tool == 'deepvariant' && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/vcfs/raw.vcf.gz",
     "results/vcfs/raw.vcf.gz.tbi",
@@ -1566,6 +2438,42 @@ glnexus_cli --dir "$glnexus_db" --mem-gbytes "$glnexus_mem_gbytes" \\
     --config DeepVariant --threads {threads} {input} 2> {log} \\
     | bcftools view -Oz -o {output[0]} - 2>> {log}
 bcftools index -f -t {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[[rules]]
+name = "glnexus_joint_long"
+description = "Jointly genotype DeepVariant gVCFs with GLnexus (long-contig CSI; consumes the CSI-archived gVCFs)"
+input = []
+expand_inputs = [
+    { pattern = "results/gvcfs/{sample}.g.vcf.gz", variables = { sample = "config.samples_list" } },
+    { pattern = "results/gvcfs/{sample}.g.vcf.gz.csi", variables = { sample = "config.samples_list" } },
+]
+when = "config.joint_genotyping_enabled && config.variant_tool == 'deepvariant' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.csi",
+]
+temp_output = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.csi",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/glnexus_joint_long.txt"
+shell = """
+glnexus_db="results/vcfs/GLnexus.DB"
+rm -rf "$glnexus_db"
+trap 'rm -rf "$glnexus_db";' EXIT
+
+glnexus_mem_gbytes=8
+if [ "$glnexus_mem_gbytes" -lt 1 ]; then
+    glnexus_mem_gbytes=1
+fi
+
+glnexus_cli --dir "$glnexus_db" --mem-gbytes "$glnexus_mem_gbytes" \\
+    --config DeepVariant --threads {threads} {input} 2> {log} \\
+    | bcftools view -Oz -o {output[0]} - 2>> {log}
+bcftools index -f -c {output[0]} 2>> {log}
 """
 tags = ["variant-calling"]
 
@@ -1628,7 +2536,7 @@ input = [
     "results/bams/markdup/*.bam",
     "results/bams/input/*.bam",
 ]
-when = "config.variant_tool == 'bcftools'"
+when = "config.variant_tool == 'bcftools' && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/vcfs/regions/{region}.vcf.gz",
     "results/vcfs/regions/{region}.vcf.gz.tbi",
@@ -1642,21 +2550,28 @@ shell = """
 : > {log}
 CONTIG=$(cat {input[1]})
 BAMS=()
+RG=()
 for s in $(echo "{config.samples_list}" | tr ',' ' '); do
     if [ -f "results/bams/markdup/$s.bam" ]; then
-        BAMS+=("results/bams/markdup/$s.bam")
+        BAMS+=("results/bams/markdup/$s.bam"); RG+=("results/bams/markdup/$s.bam" "$s")
     elif [ -f "results/bams/merged/$s.bam" ]; then
-        BAMS+=("results/bams/merged/$s.bam")
+        BAMS+=("results/bams/merged/$s.bam"); RG+=("results/bams/merged/$s.bam" "$s")
     elif [ -f "results/bams/input/$s.bam" ]; then
-        BAMS+=("results/bams/input/$s.bam")
+        BAMS+=("results/bams/input/$s.bam"); RG+=("results/bams/input/$s.bam" "$s")
     fi
 done
 if [ ${#BAMS[@]} -eq 0 ]; then
     echo "no final BAM found for any sample — skipping bcftools_call for region {region}" >> {log}
     exit 0
 fi
+# mpileup names samples by the BAMs' read-group SM, and merges BAMs that
+# share one. -G assigns every read in each BAM to its sample_id (v2.3.0).
+READ_GROUPS=$(mktemp ".oxo-bcftools-rg.XXXXXX")
+trap 'rm -f "$READ_GROUPS";' EXIT
+printf '*\\t%s\\t%s\\n' "${RG[@]}" > "$READ_GROUPS"
 bcftools mpileup \
     -f results/reference/{config.reference_name}.fa.gz \
+    -G "$READ_GROUPS" \
     -q {config.bcftools_min_mapq} \
     -Q {config.bcftools_min_baseq} \
     -d {config.bcftools_max_depth} \
@@ -1670,7 +2585,7 @@ bcftools mpileup \
         -v \
         -Oz \
         -o {output[0]} - 2>> {log}
-bcftools index -t {output[0]} 2>> {log}
+bcftools index -f -t {output[0]} 2>> {log}
 """
 tags = ["variant-calling"]
 
@@ -1681,10 +2596,72 @@ threads = 1
 conda = "envs/bcftools.yaml"
 
 [[rules]]
+name = "bcftools_call_long"
+description = "Per-region cohort mpileup + call (bcftools caller, long-contig CSI indexing)"
+input = [
+    "results/reference/{config.reference_name}.fa.gz.fai",
+    "results/vcfs/regions/{region}.txt",
+    "results/bams/merged/*.bam",
+    "results/bams/markdup/*.bam",
+    "results/bams/input/*.bam",
+]
+when = "config.variant_tool == 'bcftools' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/vcfs/regions/{region}.vcf.gz",
+    "results/vcfs/regions/{region}.vcf.gz.csi",
+]
+temp_output = [
+    "results/vcfs/regions/{region}.vcf.gz",
+    "results/vcfs/regions/{region}.vcf.gz.csi",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/bcftools_call_long/{region}.txt"
+shell = """
+: > {log}
+CONTIG=$(cat {input[1]})
+BAMS=()
+RG=()
+for s in $(echo "{config.samples_list}" | tr ',' ' '); do
+    if [ -f "results/bams/markdup/$s.bam" ]; then
+        BAMS+=("results/bams/markdup/$s.bam"); RG+=("results/bams/markdup/$s.bam" "$s")
+    elif [ -f "results/bams/merged/$s.bam" ]; then
+        BAMS+=("results/bams/merged/$s.bam"); RG+=("results/bams/merged/$s.bam" "$s")
+    elif [ -f "results/bams/input/$s.bam" ]; then
+        BAMS+=("results/bams/input/$s.bam"); RG+=("results/bams/input/$s.bam" "$s")
+    fi
+done
+if [ ${#BAMS[@]} -eq 0 ]; then
+    echo "no final BAM found for any sample — skipping bcftools_call_long for region {region}" >> {log}
+    exit 0
+fi
+READ_GROUPS=$(mktemp ".oxo-bcftools-rg.XXXXXX")
+trap 'rm -f "$READ_GROUPS";' EXIT
+printf '*\\t%s\\t%s\\n' "${RG[@]}" > "$READ_GROUPS"
+bcftools mpileup \
+    -f results/reference/{config.reference_name}.fa.gz \
+    -G "$READ_GROUPS" \
+    -q {config.bcftools_min_mapq} \
+    -Q {config.bcftools_min_baseq} \
+    -d {config.bcftools_max_depth} \
+    -r "$CONTIG" \
+    --threads {threads} \
+    -Ou "${BAMS[@]}" 2> {log} \
+    | bcftools call \
+        -m \
+        --ploidy {config.ploidy} \
+        --threads {threads} \
+        -v \
+        -Oz \
+        -o {output[0]} - 2>> {log}
+bcftools index -f -c {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[[rules]]
 name = "bcftools_concat_regions"
 description = "Concatenate per-region VCFs into the cohort raw VCF (bcftools caller)"
 input = ["results/vcfs/regions/*.vcf.gz"]
-when = "config.variant_tool == 'bcftools'"
+when = "config.variant_tool == 'bcftools' && (!file_exists(\"results/reference/.long_contig.flag\") || config.long_contig_mode == false)"
 output = [
     "results/vcfs/raw.vcf.gz",
     "results/vcfs/raw.vcf.gz.tbi",
@@ -1696,9 +2673,40 @@ temp_output = [
 depends_on = ["bcftools_regions"]
 log = "logs/bcftools_concat_regions.txt"
 shell = """
-bcftools concat -D -a -Ou {input} 2> {log} \
-    | bcftools sort -T . -Oz -o {output[0]} 2>> {log}
-bcftools index -t {output[0]} 2>> {log}
+# Each region VCF holds one contig, so nothing overlaps and concat can read
+# the files one at a time; -a would open them all at once, which exceeds the
+# open-file limit on fragmented assemblies (v2.3.0 -f LIST).
+LIST=$(mktemp ".oxo-bcftools-concat.XXXXXX")
+trap 'rm -f "$LIST";' EXIT
+printf '%s\\n' {input} > "$LIST"
+bcftools concat -D -f "$LIST" -Ou 2> {log} \
+    | bcftools sort -T . -Oz -o {output[0]} - 2>> {log}
+bcftools index -f -t {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[[rules]]
+name = "bcftools_concat_regions_long"
+description = "Concatenate per-region VCFs into the cohort raw VCF (bcftools caller, long-contig CSI indexing)"
+input = ["results/vcfs/regions/*.vcf.gz"]
+when = "config.variant_tool == 'bcftools' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.csi",
+]
+temp_output = [
+    "results/vcfs/raw.vcf.gz",
+    "results/vcfs/raw.vcf.gz.csi",
+]
+depends_on = ["bcftools_regions", "resolve_long_contig_mode"]
+log = "logs/bcftools_concat_regions_long.txt"
+shell = """
+LIST=$(mktemp ".oxo-bcftools-concat.XXXXXX")
+trap 'rm -f "$LIST";' EXIT
+printf '%s\\n' {input} > "$LIST"
+bcftools concat -D -f "$LIST" -Ou 2> {log} \
+    | bcftools sort -T . -Oz -o {output[0]} - 2>> {log}
+bcftools index -f -c {output[0]} 2>> {log}
 """
 tags = ["variant-calling"]
 
@@ -1756,29 +2764,30 @@ conda = "envs/gatk.yaml"
 
 [[rules]]
 name = "variant_filtration_long"
-description = "Apply GATK hard filters to the joint raw VCF (long-contig CSI; GATK cannot read .csi-indexed VCFs, so the raw VCF is converted to plain .vcf in-shell — upstream long-mode filtration feeds .csi to GATK and fails)"
+description = "Apply GATK hard filters to the long-contig work VCF (upstream hard_filters.smk long path: GATK/htsjdk has no CSI reader, so filtering runs on the plain work/raw.vcf and compress_filtered_vcf re-compresses the result)"
 input = [
-    "results/vcfs/raw.vcf.gz",
-    "results/vcfs/raw.vcf.gz.csi",
+    "results/vcfs/work/raw.vcf",
+    "results/vcfs/work/raw.vcf.idx",
     "results/reference/{config.reference_name}.fa.gz",
     "results/reference/{config.reference_name}.fa.gz.fai",
     "results/reference/{config.reference_name}.dict",
 ]
 when = "config.joint_genotyping_enabled && config.generate_filtered_vcf && config.variant_tool == 'gatk' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
 output = [
-    "results/vcfs/filtered.vcf.gz",
-    "results/vcfs/filtered.vcf.gz.csi",
+    "results/vcfs/work/filtered.vcf",
+    "results/vcfs/work/filtered.vcf.idx",
+]
+temp_output = [
+    "results/vcfs/work/filtered.vcf",
+    "results/vcfs/work/filtered.vcf.idx",
 ]
 depends_on = ["resolve_long_contig_mode"]
 log = "logs/variant_filtration_long.txt"
 shell = """
-: > {log}
-TMP=$(mktemp -d .oxo-filt-long.XXXXXX)
-trap 'rm -rf "$TMP";' EXIT
-bcftools view -O v -o "$TMP/raw.vcf" {input[0]} 2>> {log}
+mkdir -p results/vcfs/work
 gatk VariantFiltration \
     -R {input[2]} \
-    -V "$TMP/raw.vcf" \
+    -V {input[0]} \
     --output {output[0]} \
     --filter-name "RPRS_filter" \
     --filter-expression "(vc.isSNP() && (vc.hasAttribute('ReadPosRankSum') && ReadPosRankSum < -8.0)) || ((vc.isIndel() || vc.isMixed()) && (vc.hasAttribute('ReadPosRankSum') && ReadPosRankSum < -20.0)) || (vc.hasAttribute('QD') && QD < 2.0)" \
@@ -1788,10 +2797,8 @@ gatk VariantFiltration \
     --filter-expression "vc.isSNP() && ((vc.hasAttribute('MQ') && MQ < 40.0) || (vc.hasAttribute('MQRankSum') && MQRankSum < -12.5))" \
     --filter-name "QUAL_filter" \
     --filter-expression "QUAL < 30.0" \
-    --create-output-variant-index false \
     --invalidate-previous-filters true \
-    >> {log} 2>&1
-bcftools index -f -c {output[0]} 2>> {log}
+    &> {log}
 """
 tags = ["variant-calling"]
 
@@ -1800,6 +2807,32 @@ threads = 1
 
 [rules.environment]
 conda = "envs/gatk.yaml"
+
+[[rules]]
+name = "compress_filtered_vcf"
+description = "Compress and CSI-index the long-contig filtered work VCF into the final filtered VCF (upstream compress_filtered_vcf)"
+input = [
+    "results/vcfs/work/filtered.vcf",
+    "results/vcfs/work/filtered.vcf.idx",
+]
+when = "config.joint_genotyping_enabled && config.generate_filtered_vcf && config.variant_tool == 'gatk' && file_exists(\"results/reference/.long_contig.flag\") && config.long_contig_mode != false"
+output = [
+    "results/vcfs/filtered.vcf.gz",
+    "results/vcfs/filtered.vcf.gz.csi",
+]
+depends_on = ["resolve_long_contig_mode"]
+log = "logs/compress_filtered_vcf.txt"
+shell = """
+bcftools view -Oz -o {output[0]} {input[0]} 2> {log}
+bcftools index -f -c {output[0]} 2>> {log}
+"""
+tags = ["variant-calling"]
+
+[rules.resources]
+threads = 1
+
+[rules.environment]
+conda = "envs/bcftools.yaml"
 
 # ---------------------------------------------------------------------------
 # QC metrics (fastp stats, BAM stats, combined report)
@@ -2004,10 +3037,20 @@ output = ["results/callable_sites/depths.zarr"]
 temp_output = ["results/callable_sites/depths.zarr"]
 log = "logs/clam_collect.txt"
 shell = """
+# Name the samples explicitly: without a samples file clam names each sample
+# by its file name up to the first dot, so sample_id ind.1 would become "ind"
+# (upstream v2.3.0 clam_collect samples-file fix). The d4 names are
+# {sample}.per-base.d4, so stripping that suffix recovers the exact sample id.
+SAMPLES=$(mktemp "results/callable_sites/clam_samples_XXXXXX.tsv")
+trap 'rm -f "$SAMPLES"' EXIT
+printf 'sample_name\\tfile_path\\n' > "$SAMPLES"
+for f in {input}; do
+    printf '%s\\t%s\\n' "$(basename "$f" .per-base.d4)" "$f" >> "$SAMPLES"
+done
 clam collect \
     -o {output[0]} \
     -t {threads} \
-    {input} \
+    --samples "$SAMPLES" \
     &> {log}
 """
 tags = ["callable-sites"]
@@ -2020,15 +3063,15 @@ conda = "envs/clam.yaml"
 
 [[rules]]
 name = "callable_coverage_thresholds"
-description = "Calculate cohort-wide coverage thresholds for callable loci"
-input = []
-expand_inputs = [
-    { pattern = "results/callable_sites/depths/{sample}.mosdepth.summary.txt", variables = { sample = "config.samples_list" } },
+description = "Choose clam loci thresholds from the cohort's summed-depth distribution"
+input = [
+    "results/callable_sites/depths.zarr",
+    "results/callable_sites/mappability.bed",
 ]
 when = "config.callable_sites_enabled"
 output = ["results/callable_sites/coverage_thresholds.tsv"]
 log = "logs/callable_coverage_thresholds.txt"
-script = "scripts/callable_coverage_thresholds.py --min-coverage {config.callable_sites_min_coverage} --max-coverage {config.callable_sites_max_coverage} --output {output[0]} {input}"
+script = "scripts/callable_coverage_thresholds.py {input[0]} --mappability-bed {input[1]} --max-depth {config.callable_sites_max_depth} --max-depth-k {config.callable_sites_max_depth_k} --min-sample-depth {config.callable_sites_min_sample_depth} --fraction {config.callable_sites_fraction} --output {output[0]}"
 tags = ["callable-sites"]
 
 [rules.environment]
@@ -2036,7 +3079,7 @@ conda = "envs/callable_sites.yaml"
 
 [[rules]]
 name = "clam_loci"
-description = "Identify callable loci based on coverage"
+description = "Count, per site, the samples that make it coverage-callable (population-count mode)"
 input = [
     "results/callable_sites/depths.zarr",
     "results/callable_sites/coverage_thresholds.tsv",
@@ -2046,14 +3089,13 @@ output = ["results/callable_sites/callable_loci.zarr"]
 temp_output = ["results/callable_sites/callable_loci.zarr"]
 log = "logs/clam_loci.txt"
 shell = """
-min_depth=$(awk -F '\t' 'NR==2 {print $2}' {input[1]})
-max_depth=$(awk -F '\t' 'NR==2 {print $3}' {input[1]})
+threshold() { awk -F '\t' -v key="$1" '$1 == key {print $2}' {input[1]}; }
 clam loci \
     -o {output[0]} \
     -t {threads} \
-    --per-sample \
-    -m "$min_depth" \
-    -M "$max_depth" \
+    -m "$(threshold min_sample_depth)" \
+    -d "$(threshold clam_min_proportion)" \
+    --max-mean-depth "$(threshold clam_max_mean_depth)" \
     {input[0]} \
     &> {log}
 """
@@ -2072,7 +3114,7 @@ input = ["results/callable_sites/callable_loci.zarr"]
 when = "config.callable_sites_enabled"
 output = ["results/callable_sites/coverage.bed"]
 log = "logs/coverage_bed.txt"
-script = "scripts/callable_zarr_to_bed.py {input[0]} {output[0]} --fraction {config.callable_sites_fraction} --merge-distance {config.callable_sites_merge_distance}"
+script = "scripts/callable_zarr_to_bed.py {input[0]} {output[0]} --merge-distance {config.callable_sites_merge_distance}"
 tags = ["callable-sites"]
 
 [rules.environment]
@@ -2088,8 +3130,12 @@ log = "logs/genmap_index.txt"
 shell = """
 set -euo pipefail
 
-REF_FASTA="results/callable_sites/reference.decompressed.fa"
-trap 'rm -f "$REF_FASTA"' EXIT
+# Decompress into a job-private directory: the shared path can be a FASTA
+# another job or the user owns, and this job must not overwrite or delete it
+# (upstream v2.3.0 genmap_index WORK-dir fix).
+WORK=$(mktemp -d "results/callable_sites/genmap_index_work_XXXXXX")
+trap 'rm -rf "$WORK"' EXIT
+REF_FASTA="$WORK/$(basename "{input[0]}" .gz)"
 
 gunzip -c "{input[0]}" > "$REF_FASTA"
 SIZE_BYTES=$(wc -c < "$REF_FASTA" | tr -d '[:space:]')
@@ -2159,7 +3205,7 @@ conda = "envs/bedtools.yaml"
 
 [[rules]]
 name = "callable_sites_bed"
-description = "Combine coverage and mappability BEDs into the final callable-sites BED"
+description = "Intersect enabled callable site sources into a final callable BED"
 input = [
     "results/callable_sites/coverage.bed",
     "results/callable_sites/mappability.bed",
@@ -2168,7 +3214,11 @@ when = "config.callable_sites_enabled"
 output = ["results/callable_sites/callable_sites.bed"]
 log = "logs/callable_sites_bed.txt"
 shell = """
-cat {input[0]} {input[1]} 2> {log} \
+# A site is callable only if every enabled source passes it (upstream v2.3.0
+# intersect fix; the v2.2 cat|sort|merge was a union). The port always enables
+# both sources together, so the two-bed intersect is written concretely in
+# place of upstream's get_callable_source_beds lambda.
+(cat {input[0]} | bedtools intersect -a - -b {input[1]}) 2> {log} \
     | bedtools sort -i - 2>> {log} \
     | bedtools merge -i - > {output[0]} 2>> {log}
 """
@@ -2211,9 +3261,13 @@ temp_output = [
     "results/postprocess/basic.vcf.gz.tbi",
 ]
 shell = """
+# -a trims ALT alleles unseen in the kept samples, which can leave only the
+# spanning-deletion allele *: such a record carries no variant. ALT="*"
+# alone would match any record with a * allele, so require it to be the only
+# one (v2.3.0).
 bcftools view -S {input[1]} -f .,PASS {input[0]} -a -U -O u \\
     | bcftools +fill-tags -Ou \\
-    | bcftools view -m2 -e 'AF==0 | ref="N" | ALT="."' -O z -o {output[0]}
+    | bcftools view -m2 -e 'AF==0 | ref="N" | ALT="." | (N_ALT=1 & ALT="*")' -O z -o {output[0]}
 bcftools index -f -t {output[0]}
 """
 tags = ["postprocess"]
@@ -2239,9 +3293,13 @@ temp_output = [
 ]
 depends_on = ["resolve_long_contig_mode"]
 shell = """
+# -a trims ALT alleles unseen in the kept samples, which can leave only the
+# spanning-deletion allele *: such a record carries no variant. ALT="*"
+# alone would match any record with a * allele, so require it to be the only
+# one (v2.3.0).
 bcftools view -S {input[1]} -f .,PASS {input[0]} -a -U -O u \\
     | bcftools +fill-tags -Ou \\
-    | bcftools view -m2 -e 'AF==0 | ref="N" | ALT="."' -O z -o {output[0]}
+    | bcftools view -m2 -e 'AF==0 | ref="N" | ALT="." | (N_ALT=1 & ALT="*")' -O z -o {output[0]}
 bcftools index -f -c {output[0]}
 """
 tags = ["postprocess"]
@@ -2250,7 +3308,7 @@ tags = ["postprocess"]
 conda = "envs/postprocess_filter.yaml"
 [[rules]]
 name = "postprocess_update_bed"
-description = "Refine callable-sites BED: remove regions on contigs smaller than the configured threshold"
+description = "Refine callable-sites BED: drop contigs shorter than contig_size and the excluded scaffolds (v2.3.0 dropped_contigs rewrite — strict_filter no longer needs a scaffold-exclusion branch)"
 input = [
     "results/callable_sites/callable_sites.bed",
     "results/reference/{config.reference_name}.fa.gz.fai",
@@ -2258,16 +3316,28 @@ input = [
 when = "config.modules_postprocess_enabled && config.callable_sites_enabled"
 output = [
     "results/postprocess/callable_sites_filtered.bed",
-    "results/postprocess/small_contigs.bed",
+    "results/postprocess/dropped_contigs.bed",
 ]
-temp_output = ["results/postprocess/small_contigs.bed"]
+temp_output = ["results/postprocess/dropped_contigs.bed"]
 log = "logs/postprocess/update_bed.txt"
 shell = """
-awk 'BEGIN{OFS="\\t"}{if ($2<{config.postprocess_contig_size}) {print $1,0,$2}}' \\
-    {input[1]} > {output[1]}
-bedtools subtract -a {input[0]} -b {output[1]} \\
-    | bedtools sort -i - \\
-    | bedtools merge -i - > {output[0]}
+# Refine the callable-sites BED: contigs shorter than contig_size and the
+# excluded scaffolds land in dropped_contigs.bed; strict_filter restricts the
+# VCF to the refined BED, so VCF and BED agree on which contigs were dropped.
+awk -v size={config.postprocess_contig_size} -v excluded="{config.postprocess_exclude_scaffolds}" \\
+    'BEGIN {OFS = "\\t"; n = split(excluded, names, ","); for (i = 1; i <= n; i++) skip[names[i]] = 1}
+     $2 < size || ($1 in skip) {print $1, 0, $2}' \\
+    {input[1]} > {output[1]} 2> {log}
+bedtools subtract -a {input[0]} -b {output[1]} 2>> {log} \\
+    | bedtools sort -i - 2>> {log} \\
+    | bedtools merge -i - > {output[0]} 2>> {log}
+# bcftools rejects an empty targets file in strict_filter.
+if [ ! -s {output[0]} ]; then
+    echo "No callable sites remain after removing contigs shorter than" \\
+        "contig_size ({config.postprocess_contig_size} bp) and those in exclude_scaffolds." \\
+        | tee -a {log} >&2
+    exit 1
+fi
 """
 tags = ["postprocess"]
 
@@ -2289,17 +3359,14 @@ output = [
 ]
 log = "logs/postprocess/strict_filter.txt"
 shell = """
+# -T keeps a record when its POS is callable. -R keeps any record whose REF
+# overlaps a callable region, admitting indels anchored at a non-callable
+# base; -T also streams instead of seeking per interval (v2.3.0). Excluded
+# scaffolds are now removed by update_bed, so no -t ^ branch is needed.
 UPPER_BOUND=$(awk -v m="{config.postprocess_maf}" 'BEGIN { printf "%.6g", 1-m }')
-if [ -z "{config.postprocess_exclude_scaffolds}" ]
-then
-    bcftools view -R {input[0]} -m2 -M2 \\
-        -e "F_MISSING > {config.postprocess_missingness} | AF<{config.postprocess_maf} | AF>$UPPER_BOUND" \\
-        {input[1]} -O z -o {output[0]}
-else
-    bcftools view -t ^{config.postprocess_exclude_scaffolds} -R {input[0]} -m2 -M2 \\
-        -e "F_MISSING > {config.postprocess_missingness} | AF<{config.postprocess_maf} | AF>$UPPER_BOUND" \\
-        {input[1]} -O z -o {output[0]}
-fi
+bcftools view -T {input[0]} -m2 -M2 \\
+    -e "F_MISSING > {config.postprocess_missingness} | AF<{config.postprocess_maf} | AF>$UPPER_BOUND" \\
+    {input[1]} -O z -o {output[0]}
 bcftools index -f -t {output[0]}
 """
 tags = ["postprocess"]
@@ -2323,17 +3390,12 @@ output = [
 depends_on = ["resolve_long_contig_mode"]
 log = "logs/postprocess/strict_filter_long.txt"
 shell = """
+# -T keeps a record when its POS is callable (see short twin); excluded
+# scaffolds are removed by update_bed.
 UPPER_BOUND=$(awk -v m="{config.postprocess_maf}" 'BEGIN { printf "%.6g", 1-m }')
-if [ -z "{config.postprocess_exclude_scaffolds}" ]
-then
-    bcftools view -R {input[0]} -m2 -M2 \\
-        -e "F_MISSING > {config.postprocess_missingness} | AF<{config.postprocess_maf} | AF>$UPPER_BOUND" \\
-        {input[1]} -O z -o {output[0]}
-else
-    bcftools view -t ^{config.postprocess_exclude_scaffolds} -R {input[0]} -m2 -M2 \\
-        -e "F_MISSING > {config.postprocess_missingness} | AF<{config.postprocess_maf} | AF>$UPPER_BOUND" \\
-        {input[1]} -O z -o {output[0]}
-fi
+bcftools view -T {input[0]} -m2 -M2 \\
+    -e "F_MISSING > {config.postprocess_missingness} | AF<{config.postprocess_maf} | AF>$UPPER_BOUND" \\
+    {input[1]} -O z -o {output[0]}
 bcftools index -f -c {output[0]}
 """
 tags = ["postprocess"]
@@ -2544,19 +3606,26 @@ output = [
 temp_output = ["results/qc/filtered.vcf.gz"]
 log = "logs/qc/subsample_snps.txt"
 shell = """
-## Remove filtered sites, retain only biallelic SNPs
-## Also remove MAF < 0.01, >75% missing, indels, ref=N
-if [ -z "{config.qc_exclude_scaffolds}" ]
+## Keep unfiltered sites for the samples that passed the depth filter, then
+## retain biallelic SNPs with MAF >= 0.01 (either allele can be the minor one)
+## and <= 75% missing. The site filters must see only those samples: bcftools
+## applies -e before -S, and the caller's INFO/AF covers every sample, so AF
+## is recomputed after subsetting (v2.3.0 fill-tags stage). F_MISSING is
+## computed from the genotypes present, which are the kept samples' by then.
+## exclude mirrors upstream's _exclude_scaffolds_arg: trim the comma list,
+## hand bcftools one quoted ^list token (eval reparses the quoting).
+exclude=""
+EXCLUDE_CLEAN=$(printf '%s' "{config.qc_exclude_scaffolds}" | tr -d ' ' | sed -E 's/,+/,/g; s/^,//; s/,$//')
+if [ -n "$EXCLUDE_CLEAN" ]
 then
-    bcftools view -S {input[1]} -v snps -m2 -M2 -f .,PASS \\
-        -e 'AF==1 | AF==0 | AF<0.01 | ALT="*" | F_MISSING > 0.75 | TYPE~"indel" | ref="N"' \\
-        {input[0]} -O z -o {output[0]} &> {log}
-else
-    bcftools view -S {input[1]} -t ^{config.qc_exclude_scaffolds} -v snps -m2 -M2 -f .,PASS \\
-        -e 'AF==1 | AF==0 | AF<0.01 | ALT="*" | F_MISSING > 0.75 | TYPE~"indel" | ref="N"' \\
-        {input[0]} -O z -o {output[0]} &> {log}
+    exclude="-t '^$EXCLUDE_CLEAN'"
 fi
-bcftools index {output[0]} >> {log} 2>&1
+eval bcftools view -S {input[1]} $exclude -f .,PASS -Ou {input[0]} 2> {log} \\
+    | bcftools +fill-tags -Ou -- -t AF 2>> {log} \\
+    | bcftools view -v snps -m2 -M2 \\
+        -e 'AF==1 | AF==0 | AF<0.01 | AF>0.99 | ALT="*" | F_MISSING > 0.75 | TYPE~"indel" | ref="N"' \\
+        -O z -o {output[0]} 2>> {log}
+bcftools index -f -c {output[0]} >> {log} 2>&1
 
 # Figure out window size to get ~100k SNPs
 ALLSITES=$(bcftools query -f '%CHROM\\t%POS\\n' {output[0]} | wc -l)
@@ -2565,7 +3634,8 @@ SITES=$(( ALLSITES / 100000 ))
 # If < 150k SNPs, take all; otherwise prune
 if [[ $SITES -gt 1 ]]
 then
-    bcftools +prune -w $SITES -n 1 -N rand -O z -o {output[1]} {output[0]} >> {log} 2>&1
+    # Seeded prune (v2.3.0): reruns now give the same PCA and ADMIXTURE.
+    bcftools +prune -w $SITES -n 1 -N rand --random-seed 42 -O z -o {output[1]} {output[0]} >> {log} 2>&1
 else
     bcftools view -O z -o {output[1]} {output[0]} >> {log} 2>&1
 fi
@@ -2629,11 +3699,24 @@ output = [
 ]
 log = "logs/qc/plink.txt"
 shell = """
-plink2 --vcf {input[0]} --pca {config.qc_pca_dims} --memory {effective_memory_mb} --out results/qc/plink \\
+# v2.3.0: drop sparse samples first, so the number of PCs can follow the
+# number of samples left: plink2 cannot compute more than samples - 1.
+plink2 --vcf {input[0]} --memory {effective_memory_mb} --out results/qc/plink \\
     --vcf-half-call missing \\
     --mind {config.qc_max_sample_missingness} \\
-    --allow-extra-chr --autosome-num 95 --make-bed --make-king square \\
-    --const-fid --bad-freqs &> {log}
+    --allow-extra-chr --autosome-num 95 --make-bed \\
+    --const-fid &> {log}
+N=$(wc -l < {output[2]})
+if [ "$N" -lt 3 ]; then
+    echo "ERROR: QC needs at least 3 samples, but $N remain after the" \\
+        "depth and missingness filters (config.qc_min_depth," \\
+        "config.qc_max_sample_missingness)." | tee -a {log} >&2
+    exit 1
+fi
+PCS=$(( N - 1 < {config.qc_pca_dims} ? N - 1 : {config.qc_pca_dims} ))
+plink2 --bfile results/qc/plink --out results/qc/plink \\
+    --pca $PCS --make-king square \\
+    --allow-extra-chr --autosome-num 95 --bad-freqs &>> {log}
 plink --vcf {input[0]} --out results/qc/plink \\
     --vcf-half-call missing \\
     --mind {config.qc_max_sample_missingness} \\
@@ -2666,10 +3749,8 @@ name = "qc_admixture"
 description = "Run ADMIXTURE for K=2 and K=3"
 input = [
     "results/qc/plink.bed",
-    "results/qc/plink.bim",
     "results/qc/plink.fam",
     "results/qc/plink.bim_fixed",
-    "results/qc/plink.bim.orig",
 ]
 when = "config.modules_qc_enabled"
 output = [
@@ -2678,20 +3759,20 @@ output = [
 ]
 log = "logs/qc/admixture.txt"
 shell = """
-# Work on a private copy of the bed/bim/fam triple so the declared inputs are
-# never mutated in place (mutating {input[1]} triggered the engine's
-# "input changed while the rule was running" warning and broke provenance).
-# ADMIXTURE requires a shared prefix, so copy bed/fam alongside the fixed bim.
-cp {input[0]} results/qc/plink.admixture.bed 2>> {log}
-cp {input[2]} results/qc/plink.admixture.fam 2>> {log}
-cp {input[3]} results/qc/plink.admixture.bim 2>> {log}
-
-admixture results/qc/plink.admixture.bed 2 >> {log} 2>&1
-admixture results/qc/plink.admixture.bed 3 >> {log} 2>&1
-
-mv plink.2.* results/qc >> {log} 2>&1
-mv plink.3.* results/qc >> {log} 2>&1
-rm -f results/qc/plink.admixture.bed results/qc/plink.admixture.bim results/qc/plink.admixture.fam >> {log} 2>&1
+# v2.3.0: run in a private work dir. ADMIXTURE writes its .P/.Q next to the
+# bed prefix, so symlink the declared bed/fam and copy only the remapped .bim
+# — the declared inputs are never touched in place (the engine's "input
+# changed while the rule was running" provenance warning) and the undeclared
+# .P byproducts vanish with the work dir instead of being swept into
+# results/qc by a wildcard mv.
+WORK=$(mktemp -d results/qc/admixture_XXXXXX)
+trap 'rm -rf "$WORK";' EXIT
+ln -s "$(realpath {input[0]})" "$WORK/plink.bed"
+ln -s "$(realpath {input[1]})" "$WORK/plink.fam"
+cp {input[2]} "$WORK/plink.bim"
+(cd "$WORK" && admixture plink.bed 2 && admixture plink.bed 3) &> {log}
+mv "$WORK/plink.2.Q" {output[1]}
+mv "$WORK/plink.3.Q" {output[0]}
 """
 tags = ["qc-module"]
 
@@ -2747,7 +3828,7 @@ shell = """
 # The engine drops empty script args; keep the (possibly empty) API key as a
 # quoted shell variable so Rscript always receives all six arguments.
 GOOGLE_API_KEY="{config.qc_google_api_key}"
-Rscript scripts/qc_dashboard_render.R results/qc {config.qc_clusters} "$GOOGLE_API_KEY" true scripts/qc_dashboard_interactive.Rmd {output[0]}
+Rscript scripts/qc_dashboard_render.R results/qc {config.qc_clusters} {config.qc_min_depth} "$GOOGLE_API_KEY" true scripts/qc_dashboard_interactive.Rmd {output[0]}
 """
 tags = ["qc-module"]
 

@@ -6,3 +6,4 @@ dependencies:
   - python>=3.10
   - pandas
   - admixture
+  - coreutils  # mktemp/realpath/rm for the v2.3.0 private-work-dir run block

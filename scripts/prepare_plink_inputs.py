@@ -45,10 +45,10 @@ def main():
 
     with open(fai) as src, open(out_fai, "w") as dst:
         for line in src:
-            fields = line.rstrip("\n").split("\t")
+            fields = line.split()
             if fields:
                 fields[0] = rename_map.get(fields[0], fields[0])
-            dst.write("\t".join(fields) + "\n")
+                dst.write("\t".join(fields) + "\n")
 
     with tempfile.NamedTemporaryFile(
         "w",
