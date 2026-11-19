@@ -1,6 +1,6 @@
 # oxo-flow-snparcher — Variant calling for non-model organisms: trimming, alignment and per-sample gVCFs
 
-> ★ Verified · ⇄ Official port of [`harvardinformatics/snparcher`](https://github.com/harvardinformatics/snparcher) @ `v2.2` — same tools, same versions, same commands. Part of the [oxo-flow-community catalog](https://oxo-flow-community.github.io/).
+> ★ Verified · ⇄ Official port of [`harvardinformatics/snparcher`](https://github.com/harvardinformatics/snparcher) @ `v2.3.0` — same tools, same versions, same commands. Part of the [oxo-flow-community catalog](https://oxo-flow-community.github.io/).
 
 [![CI](https://github.com/oxo-flow-community/oxo-flow-snparcher/actions/workflows/ci.yml/badge.svg)](https://github.com/oxo-flow-community/oxo-flow-snparcher/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
@@ -167,8 +167,9 @@ runs the same 12 rules the port has always run (upstream defaults: both ON).
 | `bcftools_max_depth` | `250` | bcftools mpileup `-d` (upstream `max_depth`) |
 
 Parameter keys (`gatk_het_prior`, `deepvariant_model_type`,
-`callable_sites_min_coverage`, `callable_sites_max_coverage`,
-`callable_sites_fraction`, `callable_sites_merge_distance`,
+`callable_sites_max_depth`, `callable_sites_max_depth_k`,
+`callable_sites_min_sample_depth`, `callable_sites_fraction`,
+`callable_sites_merge_distance`,
 `callable_sites_kmer`, `callable_sites_min_score`, `postprocess_contig_size`,
 `postprocess_maf`, `postprocess_missingness`, `postprocess_exclude_scaffolds`,
 `qc_min_depth`, `qc_max_sample_missingness`, `qc_exclude_scaffolds`,
@@ -209,7 +210,7 @@ set it alongside `modules_qc_enabled=true` and `qc_google_api_key`.
 ## Source
 
 Ported from **[harvardinformatics/snparcher](https://github.com/harvardinformatics/snparcher)**,
-version `v2.2` (commit `e0e7a9478d4e042fce217db4e6077dafdaf57245`, MIT).
+version `v2.3.0` (commit `445797b54273f1feb28556e134bea3e616bc321d`, MIT).
 Created 2026-08-15; this workflow may lag behind upstream releases. Upstream
 license and attribution are recorded in [NOTICE.md](NOTICE.md).
 
@@ -217,7 +218,28 @@ license and attribution are recorded in [NOTICE.md](NOTICE.md).
 > **Port-side renames of upstream rules** (for upstream claim tracing): `concat_interval_gvcfs_stage` → `concat_interval_gvcfs` / `concat_interval_gvcfs_long`; `concat_interval_vcfs_stage` → `concat_interval_vcfs` / `concat_interval_vcfs_long`; `drop_indel_SNPs` → `postprocess_drop_indel_snps` / `postprocess_drop_indel_snps_long`. The commercial families (see Excluded) cover: `parabricks_haplotypecaller`, `parse_sentieon_stats`, `sentieon_combine_gvcf`, `sentieon_haplotyper` (plus the `sentieon_dedup`/`sentieon_*` gate rules).
 
 
-74 rules ported from upstream v2.2 (up from 60), covering every branch that
+### v2.3.0 re-port (2026-11-19)
+
+Delta from the `v2.2 @ e0e7a947` baseline (`compare v2.2...v2.3.0`, 7 commits), adopted or declined per area with upstream-file evidence:
+
+| Area (upstream file) | Verdict | Evidence |
+|---|---|---|
+| Callable-sites coverage mask redesign (`callable_sites.smk`, `scripts/callable_coverage_thresholds.py`) | adopted | new config keys `callable_sites_max_depth` / `_max_depth_k` / `_min_sample_depth`, `fraction` 1.0→0.25; script delta matches upstream 1:1 (251/251 change lines); old `min_coverage`/`max_coverage` keys removed |
+| cSRA expected-reads census (`workflow/scripts/csra_expected_reads.awk`, added upstream) | adopted | `scripts/csra_expected_reads.awk` byte-identical to upstream (`diff` empty); wired into the `download_sra` cSRA branch |
+| SRA env deps (`workflow/envs/sra.yaml`) | adopted | `samtools>=1.23` + `coreutils` added; dependency set equals upstream at v2.3.0 |
+| QC flagstat parsing (`rules/qc_metrics.smk`) | adopted | description-keyed lookups (`primary`, `primary duplicates`, `primary mapped %`, `properly paired %`) and `N/A`→NA for unpaired BAMs in `scripts/parse_bam_stats.py` / `combine_qc_metrics.py` |
+| Long-contig interval-list shared-contig rewrite (`scripts/interval_list_tools.py`) | adopted | verbatim delta 54/54 (`shared_contigs` + `rewrite_pathological_contig_chunk`); fixes the release-noted double genotyping of contigs split across shards (delete `results/intervals/db/` on long-contig projects) |
+| gVCF archives + GenomicsDB mapfile (`variant_calling/gatk_gvcf.smk`, `genomicsdb_mapfile.smk`, added upstream) | adopted | new `archive_*_gvcf*` rules and the `_long` caller/joint families keep the plain work gVCF + `.idx` for GATK (`get_gatk_joint_gvcf`); `write_joint_gvcf_mapfile.py` selects one representative path per sample and never emits an index companion |
+| Hard-filter call set (`hard_filters.smk`) | adopted | `filtered.vcf.gz` stays the call set with FILTER tags retained; `compress_filtered_vcf` / `compress_*_raw_vcf` produce the archives |
+| bcftools / DeepVariant sample naming (`bcftools.smk`, `deepvariant.smk`, `joint_gvcf*.smk`) | adopted | samples named by `sample_id` (`--sample_name {sample}`, `--sample-name-map`) instead of the BAM read-group `SM` |
+| Postprocess (`modules/postprocess/Snakefile`) | adopted | `-T` streaming callable filter; indels anchored at non-callable bases dropped; excluded scaffolds removed by `update_bed` (no `-t ^` branch) |
+| QC module (`modules/qc/Snakefile`, `qc/scripts/*`) | adopted | two-sided MAF (`AF>0.99`) with `-f .,PASS` after a `fill-tags` AF recompute (PASS retained post hard filtering); seeded `+prune --random-seed 42` (reruns give the same PCA/ADMIXTURE); QC indexes CSI; `qcctgN` contig labels unconditional (`scripts/contig_map.py`); `plink2` split into bed-then-PCA with `min(N-1, qc_pca_dims)` PCs and a ≥3-sample floor; ADMIXTURE private work dir (symlinked bed/fam); dashboard `qc_dashboard_render.R` + `qc_dashboard_interactive.Rmd` swapped to the verbatim v2.3.0 files (107 changed lines, `min_depth` param, kmeans clamp, FILTER/PASS tally); `min_depth` wipe-out now hard-fails in `scripts/vcftools_individuals.py` |
+| Startup assertions (`workflow/Snakefile`, `rules/common.smk`: ploidy guards, FASTQ-row shape, duplicate accessions, reference-source form, `exclude` bool coercion, `maf ≤ 0.5`) | declined | Snakemake start-up Python asserts over the job graph; the oxo-flow DAG build exposes no rule-level assert hook — equivalents are engine features, not port files |
+| QC module sample-sheet rework (`modules/qc/Snakefile` `samples=` + dtype `converters`) | declined | module-local sample-sheet loader; the port feeds cohorts through the engine's `--samples`, there is no sheet to coerce |
+| Sentieon / Parabricks deltas (`sentieon.smk`, `parabricks.smk` touched by 2.3.0) | declined | commercial families stay `not_applicable` (see Excluded and `metadata.excluded`) |
+| Packaging/docs surfaces (`pixi.lock`, `pyproject.toml`, `run-*.sh`, `tests/*`, `website/*`) | not-applicable | upstream packaging/CI/docs; the port's equivalents are `envs/*.yaml`, `test/run.sh` and this README |
+
+108 rules ported from upstream v2.3.0 (up from 89 at v2.2), covering every branch that
 can be expressed in oxo-flow's DAG. Commands are ported verbatim
 (same flags, same output paths); upstream's snakemake `{{...}}` shell escaping
 is unwrapped to literal braces, and snakemake `{params.*}`/`{resources.*}`
@@ -285,7 +307,7 @@ plan unchanged.
 |---|---|---|
 | parabricks (all `parabricks_*` rules) | requires `--nv` GPU passthrough (upstream `parabricks.smk` runs `--nv` images with `nvidia-docker`); the oxo-flow docker backend has no `--nv` support and no GPU device declaration; additionally NVIDIA EULA/license enforcement cannot be guaranteed in CI | `variant_calling/parabricks.smk` (every rule is `--nv`) |
 | sentieon (all `sentieon_*` rules) | proprietary tool gated on a `SENTIEON_LICENSE` server and a pre-installed license; cannot be distributed or verified in a community port | `config/config.yaml` `sentieon` section; `workflow/rules/sentieon.smk` |
-| `denovo` and `structural_variants` pipeline sections | do not exist as rules in upstream v2.2 | grep of `workflow/` at e0e7a94 finds neither rule set |
+| `denovo` and `structural_variants` pipeline sections | do not exist as rules in upstream v2.3.0 | grep of `workflow/` at e0e7a94 finds neither rule set, and the 7-commit `v2.2...v2.3.0` compare adds or modifies no file carrying either |
 | multi-library / multi-unit rows (library_id, input_unit) | `{library}` fan-out via the `library` [[values]] table (`values_from = "config.library_ids"`, default `u1` = the single-library port byte-identical); `--arg library_ids=u1,u2` fans fastp_srr/bwa_mem/markdup per library and the merge chain gathers into the per-sample BAM | multi-library FASTQ cohorts on the fastq branch name per-library sources through the SRR branch or external BAM staging (v1: the fastq branch's raw path is per-sample) |
 
 ### Documented deviations from upstream
