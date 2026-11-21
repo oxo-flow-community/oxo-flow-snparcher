@@ -1,4 +1,4 @@
-# snpArcher (harvardinformatics/snparcher @ v2.2) — oxo-flow port
+# snpArcher (harvardinformatics/snparcher @ v2.3.0) — oxo-flow port
 #
 # Default-parameters main execution path:
 #   sample sheet (FASTQ inputs) -> fastp (read trimming/filtering)

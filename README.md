@@ -206,6 +206,12 @@ set it alongside `modules_qc_enabled=true` and `qc_google_api_key`.
 - The qc module's plink steps need **≥ 2 samples** (a 1-sample cohort
   prunes to an empty VCF and `qc_plink` fails with "No samples in .vcf
   file" — upstream behaves the same on a single-sample cohort).
+- The qc dashboard's NJ phylogeny panel needs **≥ 3 samples**: with 2
+  samples the live (bioinfo-wsx) run dies at `ape::nj()` ("cannot build
+  an NJ tree with less than 3 observations") — upstream behaves the same
+  on a 2-sample cohort; the fixture ships a third haplotype (`sample3`,
+  every second planted SNP is ALT) as the minimum the upstream
+  dashboard's phylogeny needs (PR #11).
 
 ## Source
 
