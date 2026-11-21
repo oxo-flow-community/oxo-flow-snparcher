@@ -2,8 +2,8 @@ oxo-flow-snparcher
 Copyright (c) 2026 oxo-flow-community
 
 This pipeline is a port of harvardinformatics/snparcher
-(https://github.com/harvardinformatics/snparcher), version v2.2
-(commit e0e7a9478d4e042fce217db4e6077dafdaf57245), authored by
+(https://github.com/harvardinformatics/snparcher), version v2.3.0
+(commit 445797b54273f1feb28556e134bea3e616bc321d), authored by
 Harvard Informatics.
 
 Licensed under the Apache License, Version 2.0 (the "License");
